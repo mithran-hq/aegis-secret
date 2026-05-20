@@ -133,6 +133,13 @@ That per-user setup step is what creates and refreshes:
 - user-scoped Codex MCP registration
   Aegis registers itself as a Codex MCP server in the current user account, so
   Codex can use the same wrapped-command tools without extra per-repo setup.
+- user-scoped shell-bypass guard hooks, when agent config files are present
+  - `~/.claude/settings.json`
+    Aegis installs a `PreToolUse` hook for Claude `Bash` calls. The hook runs
+    `aegis-secret guard shell` before the shell command executes.
+  - `~/.codex/config.toml` and `~/.codex/hooks.json`
+    Aegis enables Codex hooks and installs a `PreToolUse` hook for shell tool
+    calls. Codex may ask you to review and trust a newly installed user hook.
 - the managed Aegis block in:
   - `~/.claude/CLAUDE.md`
     Aegis updates only its marked block there, telling Claude to prefer
@@ -141,8 +148,8 @@ That per-user setup step is what creates and refreshes:
     Aegis updates only its marked block there, telling Codex to prefer
     `list_commands` and `run_command` for wrapped tools.
 
-If that best-effort step did not run, or if you want to repair user setup
-later, run:
+If that best-effort step did not run, or if you want to repair user setup at
+any time, run:
 
 ```bash
 aegis-secret install-user
@@ -229,6 +236,13 @@ Expected agent flow:
 3. use `run_command` instead of calling that CLI directly through Bash
 4. fall back to direct shell use only when the command is not wrapped
 
+If the agent calls a wrapped command through the shell anyway, the installed
+Claude/Codex hook runs `aegis-secret guard shell`. A direct command such as
+`gh issue list`, an env-prefixed command such as `FOO=1 gh api /user`, a
+compound command such as `git status && gh issue list`, and
+`aegis-secret run gh -- ...` are blocked with exit code `2`. The feedback tells
+the agent to use the Aegis MCP `list_commands` and `run_command` tools.
+
 Expected behavior for denied commands:
 
 - the agent may try something blocked, such as `gh auth status`
@@ -239,6 +253,39 @@ Expected behavior for denied commands:
 If an existing Claude or Codex session keeps behaving as if Aegis exposes old
 tools or ignores the wrapped-command path, start a fresh session after install
 or upgrade.
+
+## Approval Leases and Diagnostics
+
+Approvals are per agent, not global. The lease key is not the process name and
+it is not a token passed by the agent. Aegis stores approvals by:
+
+- agent name, such as `Codex` or `Claude`
+- wrapped command name, such as `gh`
+- resolved executable path for that command
+- policy fingerprint for the resolved wrapped-command policy
+
+The default lease file is:
+
+```bash
+~/.config/aegis-secret/approval-leases.json
+```
+
+That file lets a new Aegis process reuse a still-valid approval for the same
+agent, command, executable path, and policy. A subprocess can also reuse the
+lease when it calls Aegis with the same agent identity. A different agent name,
+an expired window, a changed executable path, or a changed command policy gets a
+new prompt.
+
+Troubleshooting commands:
+
+```bash
+aegis-secret approval status gh --agent Codex
+AEGIS_SECRET_DEBUG=1 aegis-secret run gh -- api /user
+```
+
+`approval status` reports whether the matching lease is active, expired,
+missing, or invalidated by a policy or executable-path change. Debug mode logs
+approval cache hit and miss reasons to stderr.
 
 ## CLI Reference
 
@@ -252,6 +299,8 @@ aegis-secret command list
 aegis-secret command show <name>
 aegis-secret command validate [<name> | --file <path>]
 aegis-secret command import <json-file>
+aegis-secret approval status [<command>] [--agent <agent>]
+aegis-secret guard shell [--command <shell-command>]
 aegis-secret run <name> -- <args...>
 ```
 
@@ -264,8 +313,33 @@ aegis-secret run <name> -- <args...>
 - Aegis closes stdin for wrapped commands.
 - Aegis applies timeout and output-size limits.
 - Aegis prompts for Touch ID before wrapped-command execution.
-- Default approval caching is five minutes per wrapped command, configurable in
-  `commands.base.json` or `commands.local.json`.
+- Default approval caching is five minutes per agent and wrapped command,
+  configurable in `commands.base.json` or `commands.local.json`.
+- Approval leases are invalidated when the wrapped command policy or resolved
+  executable path changes.
+- Agent shell hooks are guardrails for common local shell paths, not a complete
+  OS-level sandbox.
+
+## Smoke Notes
+
+Use these checks before a release or after changing approval or hook behavior:
+
+```bash
+swift test
+./scripts/ci_local.sh
+.build/debug/aegis-secret guard shell --command 'gh issue list'
+```
+
+Expected smoke results:
+
+- `swift test` covers cross-process approval lease reuse, agent separation,
+  expiry, policy changes, executable path changes, hook JSON extraction, and
+  idempotent Claude/Codex hook updates.
+- `./scripts/ci_local.sh` passes.
+- direct shell guard smoke prints a message telling the agent to use
+  `list_commands` and `run_command`, then exits `2`.
+- MCP allow smoke succeeds when an agent uses Aegis MCP `list_commands` followed
+  by `run_command` for an allowed wrapped command, such as `gh api /user`.
 
 ## Development
 
