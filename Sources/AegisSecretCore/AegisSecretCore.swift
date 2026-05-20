@@ -13,6 +13,7 @@ public let bundledCodexGuidanceResourceName = "codex.guidance"
 
 public enum ExitCode: Int32 {
     case success = 0
+    case blocked = 2
     case usage = 64
     case failure = 1
 }
@@ -20,10 +21,11 @@ public enum ExitCode: Int32 {
 public enum AegisSecretError: Error, CustomStringConvertible, Equatable {
     case usage(String)
     case runtime(String)
+    case blocked(String)
 
     public var description: String {
         switch self {
-        case .usage(let message), .runtime(let message):
+        case .usage(let message), .runtime(let message), .blocked(let message):
             return message
         }
     }
@@ -1515,6 +1517,230 @@ private func matchesPrefix(_ args: [String], prefix: [String]) -> Bool {
     return Array(args.prefix(prefix.count)) == prefix
 }
 
+public struct ShellGuardResult: Equatable, Sendable {
+    public let allowed: Bool
+    public let message: String
+
+    public init(allowed: Bool, message: String = "") {
+        self.allowed = allowed
+        self.message = message
+    }
+}
+
+public struct ShellBypassGuard: Sendable {
+    public let wrappedCommandNames: Set<String>
+
+    public init(wrappedCommandNames: Set<String>) {
+        self.wrappedCommandNames = wrappedCommandNames
+    }
+
+    public func evaluate(command: String) -> ShellGuardResult {
+        for segment in shellSegments(command) {
+            let tokens = shellTokens(segment)
+            guard let executableIndex = executableTokenIndex(in: tokens) else {
+                continue
+            }
+
+            let executableName = lastPathComponent(tokens[executableIndex])
+            if wrappedCommandNames.contains(executableName) {
+                return blocked(commandName: executableName)
+            }
+
+            if executableName == "aegis-secret",
+               tokens.count > executableIndex + 2,
+               tokens[executableIndex + 1] == "run",
+               wrappedCommandNames.contains(tokens[executableIndex + 2]) {
+                return blocked(commandName: tokens[executableIndex + 2])
+            }
+        }
+
+        return ShellGuardResult(allowed: true)
+    }
+
+    private func blocked(commandName: String) -> ShellGuardResult {
+        ShellGuardResult(
+            allowed: false,
+            message: "Blocked direct shell use of wrapped command `\(commandName)`. Use the Aegis MCP `list_commands` tool, then `run_command` for `\(commandName)`."
+        )
+    }
+
+    private func executableTokenIndex(in tokens: [String]) -> Int? {
+        var index = 0
+        if tokens.first == "env" {
+            index = 1
+            while index < tokens.count {
+                if isEnvironmentAssignment(tokens[index]) {
+                    index += 1
+                } else if tokens[index] == "--" {
+                    index += 1
+                    break
+                } else if tokens[index] == "-u" || tokens[index] == "--unset" || tokens[index] == "-C" || tokens[index] == "--chdir" {
+                    index += 2
+                } else if tokens[index].hasPrefix("-") {
+                    index += 1
+                } else {
+                    break
+                }
+            }
+        }
+
+        while index < tokens.count, isEnvironmentAssignment(tokens[index]) {
+            index += 1
+        }
+
+        return index < tokens.count ? index : nil
+    }
+
+    private func isEnvironmentAssignment(_ token: String) -> Bool {
+        guard let equals = token.firstIndex(of: "="), equals != token.startIndex else {
+            return false
+        }
+        return token[..<equals].allSatisfy { character in
+            character == "_" || character.isLetter || character.isNumber
+        }
+    }
+
+    private func lastPathComponent(_ token: String) -> String {
+        URL(fileURLWithPath: token).lastPathComponent
+    }
+
+    private func shellSegments(_ command: String) -> [String] {
+        var segments: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaped = false
+
+        for character in command {
+            if escaped {
+                current.append(character)
+                escaped = false
+                continue
+            }
+
+            if character == "\\" {
+                current.append(character)
+                escaped = true
+                continue
+            }
+
+            if let activeQuote = quote {
+                current.append(character)
+                if character == activeQuote {
+                    quote = nil
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                current.append(character)
+                continue
+            }
+
+            if character == ";" || character == "|" || character == "&" || character == "(" || character == ")" {
+                appendSegment(current, to: &segments)
+                current = ""
+                continue
+            }
+
+            current.append(character)
+        }
+
+        appendSegment(current, to: &segments)
+        return segments
+    }
+
+    private func appendSegment(_ segment: String, to segments: inout [String]) {
+        let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            segments.append(trimmed)
+        }
+    }
+
+    private func shellTokens(_ segment: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaped = false
+
+        for character in segment {
+            if escaped {
+                current.append(character)
+                escaped = false
+                continue
+            }
+
+            if character == "\\" {
+                escaped = true
+                continue
+            }
+
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                continue
+            }
+
+            if character.isWhitespace {
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
+                continue
+            }
+
+            current.append(character)
+        }
+
+        if !current.isEmpty {
+            tokens.append(current)
+        }
+        return tokens
+    }
+}
+
+public struct ShellHookCommandExtractor {
+    public init() {}
+
+    public func extract(from data: Data) throws -> String {
+        guard !data.isEmpty else {
+            throw AegisSecretError.runtime("No hook input was provided.")
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AegisSecretError.runtime("Hook input was not a JSON object.")
+        }
+
+        if let command = stringValue(named: "command", in: json) ?? stringValue(named: "cmd", in: json) {
+            return command
+        }
+
+        if let toolInput = json["tool_input"] as? [String: Any],
+           let command = stringValue(named: "command", in: toolInput) ?? stringValue(named: "cmd", in: toolInput) {
+            return command
+        }
+
+        if let toolInput = json["toolInput"] as? [String: Any],
+           let command = stringValue(named: "command", in: toolInput) ?? stringValue(named: "cmd", in: toolInput) {
+            return command
+        }
+
+        throw AegisSecretError.runtime("Hook input did not include a shell command.")
+    }
+
+    private func stringValue(named name: String, in object: [String: Any]) -> String? {
+        object[name] as? String
+    }
+}
+
 public enum SecretInputMode: Equatable {
     case prompt
     case stdin
@@ -1532,6 +1758,10 @@ public enum ApprovalManagementCommand: Equatable {
     case status(command: String?, agent: String?)
 }
 
+public enum GuardCommand: Equatable {
+    case shell(command: String?)
+}
+
 public enum CLICommand: Equatable {
     case set(key: String, inputMode: SecretInputMode)
     case get(key: String, agentName: String)
@@ -1540,6 +1770,7 @@ public enum CLICommand: Equatable {
     case installUser
     case command(WrappedCommandManagementCommand)
     case approval(ApprovalManagementCommand)
+    case guardCommand(GuardCommand)
     case run(name: String, args: [String])
     case help
 }
@@ -1573,6 +1804,8 @@ public struct CommandParser {
             return try parseCommand(Array(arguments.dropFirst()))
         case "approval":
             return try parseApproval(Array(arguments.dropFirst()))
+        case "guard":
+            return try parseGuard(Array(arguments.dropFirst()))
         case "run":
             return try parseRun(Array(arguments.dropFirst()))
         case "help", "--help", "-h":
@@ -1706,6 +1939,23 @@ public struct CommandParser {
         return .approval(.status(command: commandName, agent: agentName))
     }
 
+    private func parseGuard(_ arguments: [String]) throws -> CLICommand {
+        guard arguments.first == "shell" else {
+            throw AegisSecretError.usage("`guard` requires the `shell` subcommand.")
+        }
+
+        let remaining = Array(arguments.dropFirst())
+        if remaining.isEmpty {
+            return .guardCommand(.shell(command: nil))
+        }
+
+        guard remaining.count == 2, remaining[0] == "--command" else {
+            throw AegisSecretError.usage("Usage: `aegis-secret guard shell [--command <shell-command>]`.")
+        }
+
+        return .guardCommand(.shell(command: remaining[1]))
+    }
+
     private func parseRun(_ arguments: [String]) throws -> CLICommand {
         guard let name = arguments.first, !name.hasPrefix("-") else {
             throw AegisSecretError.usage("`run` requires a wrapped command name.")
@@ -1815,6 +2065,8 @@ public struct CLIApplication {
             try handleWrappedCommandManagement(wrappedCommandCommand)
         case .approval(let approvalCommand):
             try handleApprovalManagement(approvalCommand)
+        case .guardCommand(let guardCommand):
+            try handleGuard(guardCommand)
         case .run(let name, let args):
             let result = try await wrappedCommandRunner.run(
                 name: name,
@@ -1871,6 +2123,24 @@ public struct CLIApplication {
         }
     }
 
+    private func handleGuard(_ command: GuardCommand) throws {
+        switch command {
+        case .shell(let explicitCommand):
+            let commandText = try explicitCommand ?? extractShellCommand(from: FileHandle.standardInput.readDataToEndOfFile())
+            let guardResult = try ShellBypassGuard(wrappedCommandNames: Set(commandStore.resolvedCommands().map(\.name)))
+                .evaluate(command: commandText)
+            if guardResult.allowed {
+                return
+            }
+
+            throw AegisSecretError.blocked(guardResult.message)
+        }
+    }
+
+    private func extractShellCommand(from data: Data) throws -> String {
+        try ShellHookCommandExtractor().extract(from: data)
+    }
+
     private func render(status: ApprovalLeaseStatus) -> String {
         var parts = ["status=\(status.reason.rawValue)"]
         if let lease = status.lease {
@@ -1918,6 +2188,9 @@ public struct CLIApplication {
         case .usage:
             fputs("Error: \(error.description)\n\n\(usageText)\n", stderr)
             exit(ExitCode.usage.rawValue)
+        case .blocked:
+            fputs("\(error.description)\n", stderr)
+            exit(ExitCode.blocked.rawValue)
         case .runtime:
             fputs("Error: \(error.description)\n", stderr)
             exit(ExitCode.failure.rawValue)
@@ -1937,6 +2210,7 @@ Usage:
   aegis-secret command validate [<name> | --file <path>]
   aegis-secret command import <json-file>
   aegis-secret approval status [<command>] [--agent <agent>]
+  aegis-secret guard shell [--command <shell-command>]
   aegis-secret run <name> -- <args...>
 
 Notes:

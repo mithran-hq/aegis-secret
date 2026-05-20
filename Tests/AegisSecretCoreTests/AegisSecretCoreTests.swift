@@ -107,6 +107,20 @@ final class AegisSecretCoreTests: XCTestCase {
         )
     }
 
+    func testGuardShellParsesCommand() throws {
+        XCTAssertEqual(
+            try CommandParser().parse(["guard", "shell", "--command", "gh issue list"], stdinIsTTY: true),
+            .guardCommand(.shell(command: "gh issue list"))
+        )
+    }
+
+    func testGuardShellParsesStdinMode() throws {
+        XCTAssertEqual(
+            try CommandParser().parse(["guard", "shell"], stdinIsTTY: false),
+            .guardCommand(.shell(command: nil))
+        )
+    }
+
     func testRunParsesArgsAfterDoubleDash() throws {
         XCTAssertEqual(
             try CommandParser().parse(["run", "gh", "--", "api", "/user"], stdinIsTTY: true),
@@ -675,6 +689,85 @@ final class AegisSecretCoreTests: XCTestCase {
         } catch let error as AegisSecretError {
             XCTAssertTrue(error.description.contains("absolute path"))
         }
+    }
+
+    func testShellGuardBlocksDirectWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "gh issue list")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksPathToWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "/opt/homebrew/bin/gh auth status")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksEnvironmentPrefixedWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "env GH_HOST=github.com gh issue list")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksAssignmentPrefixedWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "FOO=1 gh api /user")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksEnvOptionPrefixedWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "env -i GH_HOST=github.com gh issue list")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksCompoundWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "git status && gh issue list")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardBlocksAegisRunWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "aegis-secret run gh -- issue list")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
+    }
+
+    func testShellGuardAllowsUnrelatedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "git status --short")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardAllowsQuotedMentionOfWrappedCommand() {
+        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "printf 'gh issue list'")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellHookExtractorReadsTopLevelCommand() throws {
+        let data = #"{"command":"gh issue list"}"#.data(using: .utf8)!
+
+        XCTAssertEqual(try ShellHookCommandExtractor().extract(from: data), "gh issue list")
+    }
+
+    func testShellHookExtractorReadsNestedToolInputCommand() throws {
+        let data = #"{"tool_input":{"command":"gh issue list"}}"#.data(using: .utf8)!
+
+        XCTAssertEqual(try ShellHookCommandExtractor().extract(from: data), "gh issue list")
+    }
+
+    func testShellHookExtractorReadsNestedToolInputCamelCaseCommand() throws {
+        let data = #"{"toolInput":{"cmd":"gh issue list"}}"#.data(using: .utf8)!
+
+        XCTAssertEqual(try ShellHookCommandExtractor().extract(from: data), "gh issue list")
     }
 
     private func temporaryDirectory() throws -> URL {
