@@ -14,6 +14,7 @@ VERSION="$(release_version_from_tag "$TAG")"
 DIST_DIR="$(release_dist_dir "$TAG")"
 PKG_PATH="$DIST_DIR/Aegis Secret-$VERSION-installer.pkg"
 CHECKSUMS_PATH="$DIST_DIR/SHA256SUMS"
+RELEASE_ASSET_NAME="Aegis.Secret-$VERSION-installer.pkg"
 NOTES_FILE="${AEGIS_SECRET_RELEASE_NOTES_FILE:-}"
 REPOSITORY="${AEGIS_SECRET_GITHUB_REPOSITORY:-$DEFAULT_GITHUB_REPOSITORY}"
 TEMP_NOTES_FILE=""
@@ -60,7 +61,7 @@ What's included:
 - CLI for storing secrets and managing wrapped commands
 
 Install:
-1. Download \`Aegis Secret-$VERSION-installer.pkg\`
+1. Download \`$RELEASE_ASSET_NAME\`
 2. Open the package and complete the installer
 
 The installer places \`Aegis Secret.app\` in \`/Applications\`, installs
