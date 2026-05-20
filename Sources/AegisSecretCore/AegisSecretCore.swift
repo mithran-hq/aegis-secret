@@ -844,6 +844,41 @@ public struct ApprovalLeaseFile: Codable, Equatable, Sendable {
     }
 }
 
+public enum ApprovalLeaseMatchReason: String, Sendable {
+    case hit
+    case missingLease = "missing_lease"
+    case expired
+    case agentMismatch = "agent_mismatch"
+    case policyMismatch = "policy_mismatch"
+}
+
+public struct ApprovalLeaseStatus: Equatable, Sendable {
+    public let reason: ApprovalLeaseMatchReason
+    public let lease: ApprovalLeaseRecord?
+    public let command: String?
+    public let agent: String?
+    public let currentExecutablePath: String?
+
+    public init(
+        reason: ApprovalLeaseMatchReason,
+        lease: ApprovalLeaseRecord?,
+        command: String?,
+        agent: String?,
+        currentExecutablePath: String?
+    ) {
+        self.reason = reason
+        self.lease = lease
+        self.command = command
+        self.agent = agent
+        self.currentExecutablePath = currentExecutablePath
+    }
+}
+
+private struct ApprovalLeaseMatch {
+    let lease: ApprovalLeaseRecord?
+    let reason: ApprovalLeaseMatchReason
+}
+
 private struct FingerprintEnvironmentValue: Codable, Comparable {
     let key: String
     let value: String
@@ -883,6 +918,124 @@ public func approvalPolicyFingerprint(for command: ResolvedWrappedCommand, execu
     encoder.outputFormatting = [.sortedKeys]
     let data = try encoder.encode(policy)
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private func iso8601String(_ date: Date) -> String {
+    ISO8601DateFormatter().string(from: date)
+}
+
+public struct ApprovalLeaseInspector {
+    public let leaseFileURL: URL
+    public let commandStore: CommandStore
+    public let fileManager: FileManager
+    public let now: Date
+
+    public init(
+        leaseFileURL: URL = ApprovalCache.defaultLeaseFileURL(),
+        commandStore: CommandStore = CommandStore(),
+        fileManager: FileManager = .default,
+        now: Date = Date()
+    ) {
+        self.leaseFileURL = leaseFileURL
+        self.commandStore = commandStore
+        self.fileManager = fileManager
+        self.now = now
+    }
+
+    public func statuses(command commandFilter: String?, agent agentFilter: String?) throws -> [ApprovalLeaseStatus] {
+        let file = try readLeaseFile()
+        var statuses: [ApprovalLeaseStatus] = []
+        var sawCommandCandidate = false
+
+        for lease in file.leases {
+            if let commandFilter, lease.command != commandFilter {
+                continue
+            }
+
+            sawCommandCandidate = true
+
+            if let agentFilter, lease.agent != agentFilter {
+                statuses.append(ApprovalLeaseStatus(
+                    reason: .agentMismatch,
+                    lease: lease,
+                    command: commandFilter,
+                    agent: agentFilter,
+                    currentExecutablePath: nil
+                ))
+                continue
+            }
+
+            statuses.append(try status(for: lease, commandFilter: commandFilter, agentFilter: agentFilter))
+        }
+
+        if statuses.isEmpty {
+            statuses.append(ApprovalLeaseStatus(
+                reason: sawCommandCandidate ? .agentMismatch : .missingLease,
+                lease: nil,
+                command: commandFilter,
+                agent: agentFilter,
+                currentExecutablePath: nil
+            ))
+        }
+
+        return statuses
+    }
+
+    private func status(
+        for lease: ApprovalLeaseRecord,
+        commandFilter: String?,
+        agentFilter: String?
+    ) throws -> ApprovalLeaseStatus {
+        if lease.expiresAt <= now {
+            return ApprovalLeaseStatus(
+                reason: .expired,
+                lease: lease,
+                command: commandFilter,
+                agent: agentFilter,
+                currentExecutablePath: nil
+            )
+        }
+
+        guard let resolvedCommand = try? commandStore.resolvedCommand(named: lease.command),
+              let executableURL = commandStore.resolveExecutable(named: resolvedCommand.command) else {
+            return ApprovalLeaseStatus(
+                reason: .policyMismatch,
+                lease: lease,
+                command: commandFilter,
+                agent: agentFilter,
+                currentExecutablePath: nil
+            )
+        }
+
+        let fingerprint = try approvalPolicyFingerprint(for: resolvedCommand, executableURL: executableURL)
+        let reason: ApprovalLeaseMatchReason = (
+            lease.executablePath == executableURL.path &&
+            lease.policyFingerprint == fingerprint
+        ) ? .hit : .policyMismatch
+
+        return ApprovalLeaseStatus(
+            reason: reason,
+            lease: lease,
+            command: commandFilter,
+            agent: agentFilter,
+            currentExecutablePath: executableURL.path
+        )
+    }
+
+    private func readLeaseFile() throws -> ApprovalLeaseFile {
+        guard fileManager.fileExists(atPath: leaseFileURL.path) else {
+            return ApprovalLeaseFile(leases: [])
+        }
+
+        let data = try Data(contentsOf: leaseFileURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let file = try decoder.decode(ApprovalLeaseFile.self, from: data)
+        guard file.version == 1 else {
+            throw AegisSecretError.runtime("Unsupported approval lease file version `\(file.version)`.")
+        }
+        return file
+    }
 }
 
 public actor ApprovalCache {
@@ -929,19 +1082,20 @@ public actor ApprovalCache {
             return
         }
 
-        if command.approvalWindowSeconds > 0, let lease = try loadMatchingLease(
+        let match = try command.approvalWindowSeconds > 0 ? loadMatchingLease(
             agent: agent,
             command: command,
             executableURL: executableURL,
             policyFingerprint: policyFingerprint,
             now: currentDate
-        ) {
+        ) : ApprovalLeaseMatch(lease: nil, reason: .missingLease)
+        if let lease = match.lease {
             expirations[key] = lease.expiresAt
             debug("approval_cache_hit source=file command=\(command.name) agent=\(agent)")
             return
         }
 
-        debug("approval_cache_miss command=\(command.name) agent=\(agent)")
+        debug("approval_cache_miss reason=\(match.reason.rawValue) command=\(command.name) agent=\(agent)")
         try await authenticator.authenticate(reason: reason)
 
         if command.approvalWindowSeconds > 0 {
@@ -966,25 +1120,48 @@ public actor ApprovalCache {
         executableURL: URL,
         policyFingerprint: String,
         now currentDate: Date
-    ) throws -> ApprovalLeaseRecord? {
+    ) throws -> ApprovalLeaseMatch {
         guard let leaseFileURL else {
-            return nil
+            return ApprovalLeaseMatch(lease: nil, reason: .missingLease)
         }
 
         var file = try readLeaseFile(from: leaseFileURL)
         let beforeCount = file.leases.count
+        let hadExpiredRelevantLease = file.leases.contains {
+            $0.command == command.name &&
+            $0.agent == agent &&
+            $0.executablePath == executableURL.path &&
+            $0.policyFingerprint == policyFingerprint &&
+            $0.expiresAt <= currentDate
+        }
         file.leases.removeAll { $0.expiresAt <= currentDate }
         if beforeCount != file.leases.count {
             try writeLeaseFile(file, to: leaseFileURL)
         }
 
-        return file.leases.first {
+        if let lease = file.leases.first(where: {
             $0.agent == agent &&
             $0.command == command.name &&
             $0.executablePath == executableURL.path &&
             $0.policyFingerprint == policyFingerprint &&
             $0.expiresAt > currentDate
+        }) {
+            return ApprovalLeaseMatch(lease: lease, reason: .hit)
         }
+
+        if file.leases.contains(where: { $0.command == command.name && $0.executablePath == executableURL.path && $0.policyFingerprint == policyFingerprint }) {
+            return ApprovalLeaseMatch(lease: nil, reason: .agentMismatch)
+        }
+
+        if hadExpiredRelevantLease {
+            return ApprovalLeaseMatch(lease: nil, reason: .expired)
+        }
+
+        if file.leases.contains(where: { $0.agent == agent && $0.command == command.name }) {
+            return ApprovalLeaseMatch(lease: nil, reason: .policyMismatch)
+        }
+
+        return ApprovalLeaseMatch(lease: nil, reason: .missingLease)
     }
 
     private func storeLease(_ lease: ApprovalLeaseRecord, now currentDate: Date) throws {
@@ -1351,6 +1528,10 @@ public enum WrappedCommandManagementCommand: Equatable {
     case importFile(path: String)
 }
 
+public enum ApprovalManagementCommand: Equatable {
+    case status(command: String?, agent: String?)
+}
+
 public enum CLICommand: Equatable {
     case set(key: String, inputMode: SecretInputMode)
     case get(key: String, agentName: String)
@@ -1358,6 +1539,7 @@ public enum CLICommand: Equatable {
     case list
     case installUser
     case command(WrappedCommandManagementCommand)
+    case approval(ApprovalManagementCommand)
     case run(name: String, args: [String])
     case help
 }
@@ -1389,6 +1571,8 @@ public struct CommandParser {
             return .installUser
         case "command":
             return try parseCommand(Array(arguments.dropFirst()))
+        case "approval":
+            return try parseApproval(Array(arguments.dropFirst()))
         case "run":
             return try parseRun(Array(arguments.dropFirst()))
         case "help", "--help", "-h":
@@ -1490,6 +1674,36 @@ public struct CommandParser {
         default:
             throw AegisSecretError.usage("Unknown command subcommand `\(subcommand)`.")
         }
+    }
+
+    private func parseApproval(_ arguments: [String]) throws -> CLICommand {
+        guard arguments.first == "status" else {
+            throw AegisSecretError.usage("`approval` requires the `status` subcommand.")
+        }
+
+        var commandName: String?
+        var agentName: String?
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--agent":
+                let nextIndex = index + 1
+                guard nextIndex < arguments.count else {
+                    throw AegisSecretError.usage("`approval status --agent` requires a value.")
+                }
+                agentName = arguments[nextIndex]
+                index += 2
+            default:
+                guard !argument.hasPrefix("-"), commandName == nil else {
+                    throw AegisSecretError.usage("Usage: `aegis-secret approval status [<command>] [--agent <agent>]`.")
+                }
+                commandName = argument
+                index += 1
+            }
+        }
+
+        return .approval(.status(command: commandName, agent: agentName))
     }
 
     private func parseRun(_ arguments: [String]) throws -> CLICommand {
@@ -1599,6 +1813,8 @@ public struct CLIApplication {
             }
         case .command(let wrappedCommandCommand):
             try handleWrappedCommandManagement(wrappedCommandCommand)
+        case .approval(let approvalCommand):
+            try handleApprovalManagement(approvalCommand)
         case .run(let name, let args):
             let result = try await wrappedCommandRunner.run(
                 name: name,
@@ -1645,6 +1861,37 @@ public struct CLIApplication {
         }
     }
 
+    private func handleApprovalManagement(_ command: ApprovalManagementCommand) throws {
+        switch command {
+        case .status(let commandName, let agentName):
+            let inspector = ApprovalLeaseInspector(commandStore: commandStore)
+            for status in try inspector.statuses(command: commandName, agent: agentName) {
+                print(render(status: status))
+            }
+        }
+    }
+
+    private func render(status: ApprovalLeaseStatus) -> String {
+        var parts = ["status=\(status.reason.rawValue)"]
+        if let lease = status.lease {
+            parts.append("command=\(lease.command)")
+            parts.append("agent=\(lease.agent)")
+            parts.append("expires_at=\(iso8601String(lease.expiresAt))")
+            parts.append("executable=\(lease.executablePath)")
+        } else {
+            if let command = status.command {
+                parts.append("command=\(command)")
+            }
+            if let agent = status.agent {
+                parts.append("agent=\(agent)")
+            }
+        }
+        if let currentExecutablePath = status.currentExecutablePath, status.lease?.executablePath != currentExecutablePath {
+            parts.append("current_executable=\(currentExecutablePath)")
+        }
+        return parts.joined(separator: " ")
+    }
+
     private func readSecret(using inputMode: SecretInputMode) throws -> Data {
         switch inputMode {
         case .stdin:
@@ -1689,6 +1936,7 @@ Usage:
   aegis-secret command show <name>
   aegis-secret command validate [<name> | --file <path>]
   aegis-secret command import <json-file>
+  aegis-secret approval status [<command>] [--agent <agent>]
   aegis-secret run <name> -- <args...>
 
 Notes:

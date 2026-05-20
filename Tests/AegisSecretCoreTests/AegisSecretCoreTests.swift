@@ -100,6 +100,13 @@ final class AegisSecretCoreTests: XCTestCase {
         )
     }
 
+    func testApprovalStatusParses() throws {
+        XCTAssertEqual(
+            try CommandParser().parse(["approval", "status", "gh", "--agent", "Codex"], stdinIsTTY: true),
+            .approval(.status(command: "gh", agent: "Codex"))
+        )
+    }
+
     func testRunParsesArgsAfterDoubleDash() throws {
         XCTAssertEqual(
             try CommandParser().parse(["run", "gh", "--", "api", "/user"], stdinIsTTY: true),
@@ -570,6 +577,50 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: leaseFile.path))
     }
 
+    func testApprovalInspectorClassifiesLeaseStatus() throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let commandStore = CommandStore(fileURL: commandFile)
+        let resolvedCommand = try commandStore.resolvedCommand(named: "gh")
+        let fingerprint = try approvalPolicyFingerprint(for: resolvedCommand, executableURL: executablePath)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        try writeLeaseFile(
+            ApprovalLeaseFile(leases: [
+                ApprovalLeaseRecord(
+                    agent: "Claude",
+                    command: "gh",
+                    executablePath: executablePath.path,
+                    policyFingerprint: fingerprint,
+                    approvedAt: now,
+                    expiresAt: now.addingTimeInterval(300)
+                ),
+                ApprovalLeaseRecord(
+                    agent: "Claude",
+                    command: "aws",
+                    executablePath: "/tmp/aws",
+                    policyFingerprint: "old",
+                    approvedAt: now.addingTimeInterval(-400),
+                    expiresAt: now.addingTimeInterval(-100)
+                )
+            ]),
+            to: leaseFile
+        )
+
+        let inspector = ApprovalLeaseInspector(leaseFileURL: leaseFile, commandStore: commandStore, now: now)
+        XCTAssertEqual(try inspector.statuses(command: "gh", agent: "Claude").map(\.reason), [.hit])
+        XCTAssertEqual(try inspector.statuses(command: "gh", agent: "Codex").map(\.reason), [.agentMismatch])
+        XCTAssertEqual(try inspector.statuses(command: "aws", agent: "Claude").map(\.reason), [.expired])
+        XCTAssertEqual(try inspector.statuses(command: "kubectl", agent: "Claude").map(\.reason), [.missingLease])
+    }
+
     func testRunnerReturnsNonZeroExitCodeWithoutThrowing() async throws {
         let tempDirectory = try temporaryDirectory()
         let executablePath = try makeExecutable(named: "aws", in: tempDirectory, contents: "#!/bin/zsh\nexit 3\n")
@@ -637,5 +688,12 @@ final class AegisSecretCoreTests: XCTestCase {
         try contents.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
+    }
+
+    private func writeLeaseFile(_ file: ApprovalLeaseFile, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(file).write(to: url)
     }
 }
