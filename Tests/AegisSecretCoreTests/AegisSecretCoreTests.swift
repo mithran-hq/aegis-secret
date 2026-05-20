@@ -289,6 +289,7 @@ final class AegisSecretCoreTests: XCTestCase {
         let runner = WrappedCommandRunner(
             commandStore: CommandStore(fileURL: commandFile),
             authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
             executor: MockCommandExecutor { request in
                 XCTAssertEqual(
                     request.arguments,
@@ -325,6 +326,7 @@ final class AegisSecretCoreTests: XCTestCase {
         let runner = WrappedCommandRunner(
             commandStore: CommandStore(fileURL: commandFile),
             authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: nil),
             executor: MockCommandExecutor { request in
                 XCTAssertEqual(request.arguments, ["api", "/user"])
                 return RawCommandExecutionResult(
@@ -344,6 +346,230 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertTrue(reasons[0].contains("wrapped command 'gh'"))
     }
 
+    func testRunnerReusesPersistedApprovalAcrossCachesForSameAgent() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let runner1 = WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+            executor: MockCommandExecutor { _ in
+                RawCommandExecutionResult(stdout: Data("one\n".utf8), stderr: Data(), exitCode: 0)
+            }
+        )
+        let runner2 = WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start.addingTimeInterval(10) }),
+            executor: MockCommandExecutor { _ in
+                RawCommandExecutionResult(stdout: Data("two\n".utf8), stderr: Data(), exitCode: 0)
+            }
+        )
+
+        _ = try await runner1.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        _ = try await runner2.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: leaseFile.path))
+    }
+
+    func testPersistedApprovalDoesNotCrossAgents() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let makeRunner: (String) -> WrappedCommandRunner = { output in
+            WrappedCommandRunner(
+                commandStore: CommandStore(fileURL: commandFile),
+                authenticator: authenticator,
+                approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+                executor: MockCommandExecutor { _ in
+                    RawCommandExecutionResult(stdout: Data("\(output)\n".utf8), stderr: Data(), exitCode: 0)
+                }
+            )
+        }
+
+        _ = try await makeRunner("one").run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        _ = try await makeRunner("two").run(name: "gh", args: ["api", "/user"], requester: "Codex")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 2)
+    }
+
+    func testPersistedApprovalExpires() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 30)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let executor = MockCommandExecutor { _ in
+            RawCommandExecutionResult(stdout: Data("ok\n".utf8), stderr: Data(), exitCode: 0)
+        }
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start.addingTimeInterval(31) }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 2)
+    }
+
+    func testPersistedApprovalInvalidatesWhenPolicyChanges() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let executor = MockCommandExecutor { _ in
+            RawCommandExecutionResult(stdout: Data("ok\n".utf8), stderr: Data(), exitCode: 0)
+        }
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(
+                    name: "gh",
+                    command: executablePath.path,
+                    approvalWindowSeconds: 300,
+                    denyFlags: ["--other-host"]
+                )
+            ])
+        ).write(to: commandFile)
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start.addingTimeInterval(10) }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 2)
+    }
+
+    func testPersistedApprovalInvalidatesWhenExecutablePathChanges() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let firstExecutable = try makeExecutable(named: "gh-one", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let secondExecutable = try makeExecutable(named: "gh-two", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: firstExecutable.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let executor = MockCommandExecutor { _ in
+            RawCommandExecutionResult(stdout: Data("ok\n".utf8), stderr: Data(), exitCode: 0)
+        }
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: secondExecutable.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        _ = try await WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: authenticator,
+            approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start.addingTimeInterval(10) }),
+            executor: executor
+        ).run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 2)
+    }
+
+    func testZeroApprovalWindowDoesNotPersistLease() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        let leaseFile = tempDirectory.appendingPathComponent("approval-leases.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 0)
+            ])
+        ).write(to: commandFile)
+
+        let authenticator = AuthRecorder()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        let makeRunner: () -> WrappedCommandRunner = {
+            WrappedCommandRunner(
+                commandStore: CommandStore(fileURL: commandFile),
+                authenticator: authenticator,
+                approvalCache: ApprovalCache(leaseFileURL: leaseFile, now: { start }),
+                executor: MockCommandExecutor { _ in
+                    RawCommandExecutionResult(stdout: Data("ok\n".utf8), stderr: Data(), exitCode: 0)
+                }
+            )
+        }
+
+        _ = try await makeRunner().run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        _ = try await makeRunner().run(name: "gh", args: ["api", "/user"], requester: "Claude")
+
+        let reasons = await authenticator.snapshot()
+        XCTAssertEqual(reasons.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaseFile.path))
+    }
+
     func testRunnerReturnsNonZeroExitCodeWithoutThrowing() async throws {
         let tempDirectory = try temporaryDirectory()
         let executablePath = try makeExecutable(named: "aws", in: tempDirectory, contents: "#!/bin/zsh\nexit 3\n")
@@ -357,6 +583,7 @@ final class AegisSecretCoreTests: XCTestCase {
         let runner = WrappedCommandRunner(
             commandStore: CommandStore(fileURL: commandFile),
             authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
             executor: MockCommandExecutor { _ in
                 RawCommandExecutionResult(
                     stdout: Data("ok\n".utf8),

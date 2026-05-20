@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import LocalAuthentication
 import Security
 
@@ -596,8 +597,13 @@ public final class CommandStore: @unchecked Sendable {
             .appendingPathComponent("commands.base.json", isDirectory: false)
     }
 
-    private static func defaultConfigDirectory() -> URL {
-        let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
+    public static func defaultConfigDirectory(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        let homeDirectory: URL
+        if let home = environment["HOME"]?.trimmedNonEmpty {
+            homeDirectory = URL(fileURLWithPath: expandUserPath(home))
+        } else {
+            homeDirectory = FileManager.default.homeDirectoryForCurrentUser
+        }
         return homeDirectory
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("aegis-secret", isDirectory: true)
@@ -799,29 +805,230 @@ public final class CommandStore: @unchecked Sendable {
     }
 }
 
+public struct ApprovalLeaseRecord: Codable, Equatable, Sendable {
+    public let agent: String
+    public let command: String
+    public let executablePath: String
+    public let policyFingerprint: String
+    public let approvedAt: Date
+    public let expiresAt: Date
+
+    public init(
+        agent: String,
+        command: String,
+        executablePath: String,
+        policyFingerprint: String,
+        approvedAt: Date,
+        expiresAt: Date
+    ) {
+        self.agent = agent
+        self.command = command
+        self.executablePath = executablePath
+        self.policyFingerprint = policyFingerprint
+        self.approvedAt = approvedAt
+        self.expiresAt = expiresAt
+    }
+
+    public var cacheKey: String {
+        [agent, command, executablePath, policyFingerprint].joined(separator: "\u{1F}")
+    }
+}
+
+public struct ApprovalLeaseFile: Codable, Equatable, Sendable {
+    public let version: Int
+    public var leases: [ApprovalLeaseRecord]
+
+    public init(version: Int = 1, leases: [ApprovalLeaseRecord]) {
+        self.version = version
+        self.leases = leases
+    }
+}
+
+private struct FingerprintEnvironmentValue: Codable, Comparable {
+    let key: String
+    let value: String
+
+    static func < (lhs: FingerprintEnvironmentValue, rhs: FingerprintEnvironmentValue) -> Bool {
+        lhs.key < rhs.key
+    }
+}
+
+private struct FingerprintPolicy: Codable {
+    let name: String
+    let command: String
+    let executablePath: String
+    let approvalWindowSeconds: Int
+    let timeoutSeconds: Int
+    let maxOutputBytes: Int
+    let denyPrefixes: [[String]]
+    let allowPrefixes: [[String]]
+    let denyFlags: [String]
+    let environment: [FingerprintEnvironmentValue]
+}
+
+public func approvalPolicyFingerprint(for command: ResolvedWrappedCommand, executableURL: URL) throws -> String {
+    let policy = FingerprintPolicy(
+        name: command.name,
+        command: command.command,
+        executablePath: executableURL.path,
+        approvalWindowSeconds: command.approvalWindowSeconds,
+        timeoutSeconds: command.timeoutSeconds,
+        maxOutputBytes: command.maxOutputBytes,
+        denyPrefixes: command.denyPrefixes,
+        allowPrefixes: command.allowPrefixes,
+        denyFlags: command.denyFlags.sorted(),
+        environment: command.environment.map { FingerprintEnvironmentValue(key: $0.key, value: $0.value) }.sorted()
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(policy)
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
 public actor ApprovalCache {
     private var expirations: [String: Date] = [:]
+    private let leaseFileURL: URL?
+    private let fileManager: FileManager
+    private let now: @Sendable () -> Date
 
-    public init() {}
+    public init(
+        leaseFileURL: URL? = ApprovalCache.defaultLeaseFileURL(),
+        fileManager: FileManager = .default,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
+        self.leaseFileURL = leaseFileURL
+        self.fileManager = fileManager
+        self.now = now
+    }
+
+    public static func defaultLeaseFileURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        CommandStore.defaultConfigDirectory(environment: environment)
+            .appendingPathComponent("approval-leases.json", isDirectory: false)
+    }
 
     public func authorize(
-        key: String,
-        windowSeconds: Int,
+        agent: String,
+        command: ResolvedWrappedCommand,
+        executableURL: URL,
+        policyFingerprint: String,
         reason: String,
         authenticator: DeviceAuthenticator
     ) async throws {
-        let now = Date()
-        if let expiration = expirations[key], expiration > now {
+        let currentDate = now()
+        let key = ApprovalLeaseRecord(
+            agent: agent,
+            command: command.name,
+            executablePath: executableURL.path,
+            policyFingerprint: policyFingerprint,
+            approvedAt: currentDate,
+            expiresAt: currentDate
+        ).cacheKey
+
+        if let expiration = expirations[key], expiration > currentDate {
+            debug("approval_cache_hit source=memory command=\(command.name) agent=\(agent)")
             return
         }
 
+        if command.approvalWindowSeconds > 0, let lease = try loadMatchingLease(
+            agent: agent,
+            command: command,
+            executableURL: executableURL,
+            policyFingerprint: policyFingerprint,
+            now: currentDate
+        ) {
+            expirations[key] = lease.expiresAt
+            debug("approval_cache_hit source=file command=\(command.name) agent=\(agent)")
+            return
+        }
+
+        debug("approval_cache_miss command=\(command.name) agent=\(agent)")
         try await authenticator.authenticate(reason: reason)
 
-        if windowSeconds > 0 {
-            expirations[key] = now.addingTimeInterval(TimeInterval(windowSeconds))
+        if command.approvalWindowSeconds > 0 {
+            let expiration = currentDate.addingTimeInterval(TimeInterval(command.approvalWindowSeconds))
+            expirations[key] = expiration
+            try storeLease(ApprovalLeaseRecord(
+                agent: agent,
+                command: command.name,
+                executablePath: executableURL.path,
+                policyFingerprint: policyFingerprint,
+                approvedAt: currentDate,
+                expiresAt: expiration
+            ), now: currentDate)
         } else {
             expirations.removeValue(forKey: key)
         }
+    }
+
+    private func loadMatchingLease(
+        agent: String,
+        command: ResolvedWrappedCommand,
+        executableURL: URL,
+        policyFingerprint: String,
+        now currentDate: Date
+    ) throws -> ApprovalLeaseRecord? {
+        guard let leaseFileURL else {
+            return nil
+        }
+
+        var file = try readLeaseFile(from: leaseFileURL)
+        let beforeCount = file.leases.count
+        file.leases.removeAll { $0.expiresAt <= currentDate }
+        if beforeCount != file.leases.count {
+            try writeLeaseFile(file, to: leaseFileURL)
+        }
+
+        return file.leases.first {
+            $0.agent == agent &&
+            $0.command == command.name &&
+            $0.executablePath == executableURL.path &&
+            $0.policyFingerprint == policyFingerprint &&
+            $0.expiresAt > currentDate
+        }
+    }
+
+    private func storeLease(_ lease: ApprovalLeaseRecord, now currentDate: Date) throws {
+        guard let leaseFileURL else {
+            return
+        }
+
+        var file = try readLeaseFile(from: leaseFileURL)
+        file.leases.removeAll {
+            $0.expiresAt <= currentDate || $0.cacheKey == lease.cacheKey
+        }
+        file.leases.append(lease)
+        try writeLeaseFile(file, to: leaseFileURL)
+    }
+
+    private func readLeaseFile(from url: URL) throws -> ApprovalLeaseFile {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return ApprovalLeaseFile(leases: [])
+        }
+
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let file = try decoder.decode(ApprovalLeaseFile.self, from: data)
+        guard file.version == 1 else {
+            throw AegisSecretError.runtime("Unsupported approval lease file version `\(file.version)`.")
+        }
+        return file
+    }
+
+    private func writeLeaseFile(_ file: ApprovalLeaseFile, to url: URL) throws {
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(file)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func debug(_ message: String) {
+        guard ProcessInfo.processInfo.environment["AEGIS_SECRET_DEBUG"] == "1" else {
+            return
+        }
+        fputs("[aegis-secret] \(message)\n", stderr)
     }
 }
 
@@ -1022,9 +1229,12 @@ public struct WrappedCommandRunner: Sendable {
         let workingDirectoryURL = try resolveWorkingDirectory(cwd)
         let requesterLabel = requester?.trimmedNonEmpty ?? "the local agent"
         let reason = "Allow \(requesterLabel) to run wrapped command '\(wrappedCommand.name)'."
+        let policyFingerprint = try approvalPolicyFingerprint(for: wrappedCommand, executableURL: executableURL)
         try await approvalCache.authorize(
-            key: wrappedCommand.name,
-            windowSeconds: wrappedCommand.approvalWindowSeconds,
+            agent: requesterLabel,
+            command: wrappedCommand,
+            executableURL: executableURL,
+            policyFingerprint: policyFingerprint,
             reason: reason,
             authenticator: authenticator
         )
