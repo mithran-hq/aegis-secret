@@ -60,7 +60,7 @@ What's included:
 - CLI for storing secrets and managing wrapped commands
 
 Install:
-1. Download \`Aegis.Secret-$VERSION-installer.pkg\`
+1. Download \`Aegis Secret-$VERSION-installer.pkg\`
 2. Open the package and complete the installer
 
 The installer places \`Aegis Secret.app\` in \`/Applications\`, installs
