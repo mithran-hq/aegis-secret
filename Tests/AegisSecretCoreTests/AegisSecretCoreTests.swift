@@ -770,6 +770,114 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertEqual(try ShellHookCommandExtractor().extract(from: data), "gh issue list")
     }
 
+    func testClaudeHookUpdaterPreservesExistingHooksAndIsIdempotent() throws {
+        let existing = """
+        {
+          "permissions": { "allow": ["Bash(*)"] },
+          "hooks": {
+            "PreToolUse": [
+              {
+                "matcher": "Edit",
+                "hooks": [
+                  { "type": "command", "command": "/tmp/edit-check" }
+                ]
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+        let executableURL = URL(fileURLWithPath: "/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret")
+        let updater = AgentHookConfigUpdater()
+
+        let once = try updater.upsertClaudeSettings(data: existing, executableURL: executableURL)
+        let twice = try updater.upsertClaudeSettings(data: once, executableURL: executableURL)
+
+        XCTAssertEqual(String(data: once, encoding: .utf8), String(data: twice, encoding: .utf8))
+        let root = try jsonDictionary(from: twice)
+        let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+        let preToolUse = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]])
+        XCTAssertEqual(preToolUse.count, 2)
+        XCTAssertTrue(preToolUse.contains { $0["matcher"] as? String == "Edit" })
+        let managed = try XCTUnwrap(preToolUse.first { $0["matcher"] as? String == "Bash" })
+        let managedHooks = try XCTUnwrap(managed["hooks"] as? [[String: Any]])
+        XCTAssertEqual(managedHooks.first?["command"] as? String, executableURL.path)
+        XCTAssertEqual(managedHooks.first?["args"] as? [String], ["guard", "shell"])
+    }
+
+    func testCodexHookUpdaterPreservesExistingHooksAndIsIdempotent() throws {
+        let existing = """
+        {
+          "hooks": {
+            "PreToolUse": [
+              {
+                "matcher": "Edit",
+                "hooks": [
+                  { "type": "command", "command": "/tmp/edit-check" }
+                ]
+              }
+            ],
+            "PostToolUse": [
+              {
+                "matcher": "Bash",
+                "hooks": [
+                  { "type": "command", "command": "/tmp/audit" }
+                ]
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+        let executableURL = URL(fileURLWithPath: "/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret")
+        let updater = AgentHookConfigUpdater()
+
+        let once = try updater.upsertCodexHooks(data: existing, executableURL: executableURL)
+        let twice = try updater.upsertCodexHooks(data: once, executableURL: executableURL)
+
+        XCTAssertEqual(String(data: once, encoding: .utf8), String(data: twice, encoding: .utf8))
+        let root = try jsonDictionary(from: twice)
+        let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+        let preToolUse = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]])
+        let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        XCTAssertEqual(preToolUse.count, 2)
+        XCTAssertEqual(postToolUse.count, 1)
+        XCTAssertTrue(preToolUse.contains { $0["matcher"] as? String == "Edit" })
+        let managed = try XCTUnwrap(preToolUse.first {
+            ($0["matcher"] as? String)?.contains("Bash") == true
+        })
+        let managedHooks = try XCTUnwrap(managed["hooks"] as? [[String: Any]])
+        XCTAssertEqual(
+            managedHooks.first?["command"] as? String,
+            "'/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret' guard shell"
+        )
+    }
+
+    func testCodexConfigUpdaterAddsFeatureFlagWhenMissing() {
+        let updated = AgentHookConfigUpdater().upsertCodexConfig("model = \"gpt-5.5\"\n")
+
+        XCTAssertTrue(updated.contains("[features]\nhooks = true\n"))
+    }
+
+    func testCodexConfigUpdaterRefreshesExistingFeatureFlagIdempotently() {
+        let existing = """
+        model = "gpt-5.5"
+
+        [features]
+        hooks = false
+        plugins = true
+
+        [tui]
+        theme = "dark"
+        """
+        let updater = AgentHookConfigUpdater()
+
+        let once = updater.upsertCodexConfig(existing)
+        let twice = updater.upsertCodexConfig(once)
+
+        XCTAssertEqual(once, twice)
+        XCTAssertTrue(once.contains("[features]\nhooks = true\nplugins = true"))
+        XCTAssertTrue(once.contains("[tui]\ntheme = \"dark\""))
+    }
+
     private func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -788,5 +896,9 @@ final class AegisSecretCoreTests: XCTestCase {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(file).write(to: url)
+    }
+
+    private func jsonDictionary(from data: Data) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 }

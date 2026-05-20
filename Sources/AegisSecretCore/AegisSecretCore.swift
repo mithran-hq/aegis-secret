@@ -2052,6 +2052,12 @@ public struct CLIApplication {
             if installation.registeredClaude {
                 print("Registered the Claude MCP server.")
             }
+            if installation.installedCodexHook {
+                print("Installed the managed Codex shell-bypass guard hook.")
+            }
+            if installation.installedClaudeHook {
+                print("Installed the managed Claude shell-bypass guard hook.")
+            }
             if !installation.registeredCodex && !installation.registeredClaude {
                 print("No supported MCP client CLI was found, so only PATH shims were created.")
             }
@@ -2224,8 +2230,146 @@ public struct UserInstallationSummary {
     public let appBundleURL: URL
     public let registeredCodex: Bool
     public let registeredClaude: Bool
+    public let installedCodexHook: Bool
+    public let installedClaudeHook: Bool
     public let updatedCodexGuidance: Bool
     public let updatedClaudeGuidance: Bool
+}
+
+public struct AgentHookConfigUpdater {
+    public static let managedStatusMessage = "Aegis Secret: checking wrapped CLI route"
+
+    public init() {}
+
+    public func upsertClaudeSettings(data: Data, executableURL: URL) throws -> Data {
+        var root = try mutableJSONObject(from: data, fallback: [:], label: "Claude settings")
+        var hooks = try dictionaryValue(root["hooks"], label: "Claude hooks")
+        var preToolUse = try arrayOfDictionariesValue(hooks["PreToolUse"], label: "Claude PreToolUse hooks")
+        preToolUse.removeAll(where: isManagedHookGroup)
+        preToolUse.append([
+            "matcher": "Bash",
+            "hooks": [[
+                "type": "command",
+                "command": executableURL.path,
+                "args": ["guard", "shell"],
+                "timeout": 10,
+                "statusMessage": Self.managedStatusMessage
+            ]]
+        ])
+        hooks["PreToolUse"] = preToolUse
+        root["hooks"] = hooks
+        return try encodeJSONObject(root)
+    }
+
+    public func upsertCodexHooks(data: Data?, executableURL: URL) throws -> Data {
+        var root = try mutableJSONObject(from: data, fallback: ["hooks": [:]], label: "Codex hooks")
+        var hooks = try dictionaryValue(root["hooks"], label: "Codex hooks root")
+        var preToolUse = try arrayOfDictionariesValue(hooks["PreToolUse"], label: "Codex PreToolUse hooks")
+        preToolUse.removeAll(where: isManagedHookGroup)
+        preToolUse.append([
+            "matcher": "^(Bash|shell|exec_command|unified_exec)$",
+            "hooks": [[
+                "type": "command",
+                "command": "\(shellQuote(executableURL.path)) guard shell",
+                "timeout": 10,
+                "statusMessage": Self.managedStatusMessage
+            ]]
+        ])
+        hooks["PreToolUse"] = preToolUse
+        root["hooks"] = hooks
+        return try encodeJSONObject(root)
+    }
+
+    public func upsertCodexConfig(_ existing: String) -> String {
+        var lines = existing.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var featuresStart: Int?
+        var featuresEnd = lines.count
+
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "[features]" {
+                featuresStart = index
+                featuresEnd = lines.count
+                continue
+            }
+
+            if featuresStart != nil,
+               index > featuresStart!,
+               trimmed.hasPrefix("["),
+               trimmed.hasSuffix("]") {
+                featuresEnd = index
+                break
+            }
+        }
+
+        if let featuresStart {
+            for index in (featuresStart + 1)..<featuresEnd {
+                let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("hooks") && trimmed.dropFirst("hooks".count).trimmingCharacters(in: .whitespaces).hasPrefix("=") {
+                    lines[index] = "hooks = true"
+                    return lines.joined(separator: "\n").ensureTrailingNewline()
+                }
+            }
+
+            lines.insert("hooks = true", at: featuresStart + 1)
+            return lines.joined(separator: "\n").ensureTrailingNewline()
+        }
+
+        let prefix = existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : existing.ensureTrailingNewline() + "\n"
+        return prefix + """
+        [features]
+        hooks = true
+        """
+        .ensureTrailingNewline()
+    }
+
+    private func mutableJSONObject(from data: Data?, fallback: [String: Any], label: String) throws -> [String: Any] {
+        guard let data, !data.isEmpty else {
+            return fallback
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AegisSecretError.runtime("\(label) must be a JSON object.")
+        }
+        return json
+    }
+
+    private func dictionaryValue(_ value: Any?, label: String) throws -> [String: Any] {
+        guard let value else {
+            return [:]
+        }
+        guard let dictionary = value as? [String: Any] else {
+            throw AegisSecretError.runtime("\(label) must be a JSON object.")
+        }
+        return dictionary
+    }
+
+    private func arrayOfDictionariesValue(_ value: Any?, label: String) throws -> [[String: Any]] {
+        guard let value else {
+            return []
+        }
+        guard let array = value as? [[String: Any]] else {
+            throw AegisSecretError.runtime("\(label) must be an array of objects.")
+        }
+        return array
+    }
+
+    private func isManagedHookGroup(_ group: [String: Any]) -> Bool {
+        guard let hooks = group["hooks"] as? [[String: Any]] else {
+            return false
+        }
+
+        return hooks.contains { hook in
+            hook["statusMessage"] as? String == Self.managedStatusMessage
+                || ((hook["command"] as? String)?.contains("aegis-secret") == true
+                    && (hook["command"] as? String)?.contains("guard shell") == true)
+        }
+    }
+
+    private func encodeJSONObject(_ object: [String: Any]) throws -> Data {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        return data + Data([0x0A])
+    }
 }
 
 public struct UserInstaller {
@@ -2276,6 +2420,8 @@ public struct UserInstaller {
         let serverName = "aegis-secret"
         let registeredCodex = try registerCodex(serverName: serverName, executableURL: executableURL)
         let registeredClaude = try registerClaude(serverName: serverName, executableURL: executableURL)
+        let installedCodexHook = registeredCodex ? try installCodexHook(executableURL: executableURL) : false
+        let installedClaudeHook = registeredClaude ? try installClaudeHook(executableURL: executableURL) : false
         let updatedCodexGuidance = try updateCodexGuidance()
         let updatedClaudeGuidance = try updateClaudeGuidance()
 
@@ -2283,6 +2429,8 @@ public struct UserInstaller {
             appBundleURL: appBundleURL,
             registeredCodex: registeredCodex,
             registeredClaude: registeredClaude,
+            installedCodexHook: installedCodexHook,
+            installedClaudeHook: installedClaudeHook,
             updatedCodexGuidance: updatedCodexGuidance,
             updatedClaudeGuidance: updatedClaudeGuidance
         )
@@ -2380,6 +2528,50 @@ public struct UserInstaller {
             executableURL: claudeExecutable,
             arguments: ["mcp", "add-json", "-s", "user", serverName, payload]
         )
+        return true
+    }
+
+    private func installCodexHook(executableURL: URL) throws -> Bool {
+        let codexDirectory = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+        let configURL = codexDirectory.appendingPathComponent("config.toml", isDirectory: false)
+        guard fileManager.fileExists(atPath: configURL.path) else {
+            return false
+        }
+
+        let updater = AgentHookConfigUpdater()
+        let existingConfig = (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
+        let updatedConfig = updater.upsertCodexConfig(existingConfig)
+        if updatedConfig != existingConfig {
+            try updatedConfig.write(to: configURL, atomically: true, encoding: .utf8)
+        }
+
+        let hooksURL = codexDirectory.appendingPathComponent("hooks.json", isDirectory: false)
+        let existingHooks = try? Data(contentsOf: hooksURL)
+        let updatedHooks = try updater.upsertCodexHooks(data: existingHooks, executableURL: executableURL)
+        if updatedHooks != existingHooks {
+            try updatedHooks.write(to: hooksURL, options: .atomic)
+        }
+
+        return true
+    }
+
+    private func installClaudeHook(executableURL: URL) throws -> Bool {
+        let settingsURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json", isDirectory: false)
+        guard fileManager.fileExists(atPath: settingsURL.path) else {
+            return false
+        }
+
+        let existingSettings = try Data(contentsOf: settingsURL)
+        let updatedSettings = try AgentHookConfigUpdater().upsertClaudeSettings(
+            data: existingSettings,
+            executableURL: executableURL
+        )
+        if updatedSettings != existingSettings {
+            try updatedSettings.write(to: settingsURL, options: .atomic)
+        }
+
         return true
     }
 
@@ -2551,5 +2743,9 @@ private extension String {
 
     var nilIfEmpty: String? {
         isEmpty ? nil : self
+    }
+
+    func ensureTrailingNewline() -> String {
+        hasSuffix("\n") ? self : self + "\n"
     }
 }
