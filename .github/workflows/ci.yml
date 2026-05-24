@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -22,13 +25,18 @@ jobs:
 
       - name: Detect CI-relevant changes
         id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            base_ref="${{ github.event.pull_request.base.sha }}"
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            base_ref="${PULL_REQUEST_BASE_SHA}"
           else
-            base_ref="${{ github.event.before }}"
+            base_ref="${EVENT_BEFORE_SHA}"
           fi
-          head_ref="${{ github.sha }}"
+          head_ref="${EVENT_SHA}"
           python3 - <<'PY' "$base_ref" "$head_ref" >>"$GITHUB_OUTPUT"
           import subprocess
           import sys
