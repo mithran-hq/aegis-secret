@@ -11,6 +11,7 @@ public let receiptsFileEnvironmentKey = "AEGIS_SECRET_RECEIPTS_FILE"
 public let bundledCommandsResourceName = "commands.default"
 public let bundledClaudeGuidanceResourceName = "claude.guidance"
 public let bundledCodexGuidanceResourceName = "codex.guidance"
+public let secretEnvironmentReferencePrefix = "aegis-secret://"
 
 public enum ExitCode: Int32 {
     case success = 0
@@ -1632,19 +1633,22 @@ public struct WrappedCommandRunner: Sendable {
     public let approvalCache: ApprovalCache
     public let executor: CommandExecutor
     public let environment: [String: String]
+    public let secretStore: (any SecretStore)?
 
     public init(
         commandStore: CommandStore = CommandStore(),
         authenticator: DeviceAuthenticator = LocalDeviceAuthenticator(),
         approvalCache: ApprovalCache = ApprovalCache(),
         executor: CommandExecutor = ProcessCommandExecutor(),
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        secretStore: (any SecretStore)? = nil
     ) {
         self.commandStore = commandStore
         self.authenticator = authenticator
         self.approvalCache = approvalCache
         self.executor = executor
         self.environment = environment
+        self.secretStore = secretStore
     }
 
     public func run(
@@ -1677,7 +1681,12 @@ public struct WrappedCommandRunner: Sendable {
 
         var executionEnvironment = environment
         for (key, value) in wrappedCommand.environment {
-            executionEnvironment[key] = value
+            executionEnvironment[key] = try resolvedEnvironmentValue(
+                value,
+                environmentKey: key,
+                commandName: wrappedCommand.name,
+                requester: requesterLabel
+            )
         }
 
         let rawResult = try await executor.execute(
@@ -1793,6 +1802,28 @@ public struct WrappedCommandRunner: Sendable {
         )
     }
 
+    private func resolvedEnvironmentValue(
+        _ value: String,
+        environmentKey: String,
+        commandName: String,
+        requester: String
+    ) throws -> String {
+        guard let secretKey = secretReferenceKey(from: value) else {
+            return value
+        }
+
+        guard let secretStore else {
+            throw AegisSecretError.runtime("Wrapped command `\(commandName)` requires secret `\(secretKey)` for environment variable `\(environmentKey)`, but no secret store is configured.")
+        }
+
+        let reason = "Allow \(requester) to inject secret '\(secretKey)' into wrapped command '\(commandName)'."
+        let secretData = try secretStore.readSecret(for: secretKey, reason: reason)
+        guard let secret = String(data: secretData, encoding: .utf8) else {
+            throw AegisSecretError.runtime("Secret `\(secretKey)` for wrapped command `\(commandName)` is not valid UTF-8.")
+        }
+        return secret
+    }
+
     private func validate(args: [String], for command: ResolvedWrappedCommand) throws {
         for argument in args {
             if command.denyFlags.contains(argument) || command.denyFlags.contains(where: { argument.hasPrefix("\($0)=") }) {
@@ -1860,6 +1891,14 @@ private func matchesPrefix(_ args: [String], prefix: [String]) -> Bool {
         return false
     }
     return Array(args.prefix(prefix.count)) == prefix
+}
+
+private func secretReferenceKey(from value: String) -> String? {
+    guard value.hasPrefix(secretEnvironmentReferencePrefix) else {
+        return nil
+    }
+
+    return String(value.dropFirst(secretEnvironmentReferencePrefix.count)).trimmedNonEmpty
 }
 
 public struct ShellGuardResult: Equatable, Sendable {
@@ -2715,7 +2754,8 @@ public struct CLIApplication {
         self.commandStore = commandStore
         self.wrappedCommandRunner = wrappedCommandRunner ?? WrappedCommandRunner(
             commandStore: commandStore,
-            authenticator: authenticator
+            authenticator: authenticator,
+            secretStore: secretStore
         )
     }
 

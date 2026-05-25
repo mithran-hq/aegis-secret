@@ -69,6 +69,8 @@ protected action requires MCP. Ordinary commands are not brokered by default. It
 does not get `get_secret`, `set_secret`, or `delete_secret` over MCP.
 MCP decisions are written as local JSONL receipts for the Aegis daemon; see
 `docs/tool-decision-receipts.md`.
+Run `scripts/local-broker-proof.sh` for the hosted-infra-free local broker proof;
+see `docs/local-broker-proof.md`.
 
 ## Quick Start
 

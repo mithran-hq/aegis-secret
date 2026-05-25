@@ -491,6 +491,46 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertNil(receipt.output)
     }
 
+    func testRunnerInjectsReferencedSecretWithoutReceiptLeakage() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(
+                    name: "gh",
+                    command: executablePath.path,
+                    environment: ["GH_TOKEN": "\(secretEnvironmentReferencePrefix)github-app-token"]
+                )
+            ])
+        ).write(to: commandFile)
+
+        let runner = WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.environment["GH_TOKEN"], "secret-token-123")
+                return RawCommandExecutionResult(
+                    stdout: Data("token absent\n".utf8),
+                    stderr: Data(),
+                    exitCode: 0
+                )
+            },
+            secretStore: InMemorySecretStore(secrets: [
+                "github-app-token": Data("secret-token-123".utf8)
+            ])
+        )
+
+        let result = try await runner.run(name: "gh", args: ["api", "/user"], requester: "Codex", surface: "mcp")
+        let encodedReceipt = String(decoding: try JSONEncoder().encode(result.receipt), as: UTF8.self)
+
+        XCTAssertEqual(result.stdout, "token absent\n")
+        XCTAssertFalse(encodedReceipt.contains("secret-token-123"))
+        XCTAssertFalse(encodedReceipt.contains("github-app-token"))
+        XCTAssertEqual(result.receipt.redaction.rawSecretMCPCRUDAvailable, false)
+    }
+
     func testRunnerReusesPersistedApprovalAcrossCachesForSameAgent() async throws {
         let tempDirectory = try temporaryDirectory()
         let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")

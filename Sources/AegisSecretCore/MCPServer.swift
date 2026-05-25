@@ -147,7 +147,7 @@ public final class StdioMCPServer {
         receiptRecorder: ToolDecisionReceiptRecorder = ToolDecisionReceiptRecorder()
     ) {
         self.commandStore = commandStore
-        self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore)
+        self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore, secretStore: KeychainSecretStore())
         self.agentName = agentName
         self.receiptRecorder = receiptRecorder
     }
