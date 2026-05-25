@@ -7,6 +7,7 @@ public let aegisSecretServiceName = "Aegis Secrets"
 public let aegisSecretMetadataServiceName = "Aegis Secrets Metadata"
 public let commandsFileEnvironmentKey = "AEGIS_SECRET_COMMANDS_FILE"
 public let systemCommandsFileEnvironmentKey = "AEGIS_SECRET_SYSTEM_COMMANDS_FILE"
+public let receiptsFileEnvironmentKey = "AEGIS_SECRET_RECEIPTS_FILE"
 public let bundledCommandsResourceName = "commands.default"
 public let bundledClaudeGuidanceResourceName = "claude.guidance"
 public let bundledCodexGuidanceResourceName = "codex.guidance"
@@ -876,9 +877,29 @@ public struct ApprovalLeaseStatus: Equatable, Sendable {
     }
 }
 
+public enum ApprovalAuthorizationOutcome: String, Codable, Equatable, Sendable {
+    case cacheHitMemory = "cache_hit_memory"
+    case cacheHitFile = "cache_hit_file"
+    case prompted
+    case notRequired = "not_required"
+    case notEvaluated = "not_evaluated"
+    case deniedByPolicy = "denied_by_policy"
+}
+
 private struct ApprovalLeaseMatch {
     let lease: ApprovalLeaseRecord?
     let reason: ApprovalLeaseMatchReason
+    let source: ApprovalAuthorizationOutcome?
+
+    init(
+        lease: ApprovalLeaseRecord?,
+        reason: ApprovalLeaseMatchReason,
+        source: ApprovalAuthorizationOutcome? = nil
+    ) {
+        self.lease = lease
+        self.reason = reason
+        self.source = source
+    }
 }
 
 private struct FingerprintEnvironmentValue: Codable, Comparable {
@@ -922,7 +943,11 @@ public func approvalPolicyFingerprint(for command: ResolvedWrappedCommand, execu
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
-private func iso8601String(_ date: Date) -> String {
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func iso8601String(_ date: Date) -> String {
     ISO8601DateFormatter().string(from: date)
 }
 
@@ -1061,6 +1086,7 @@ public actor ApprovalCache {
             .appendingPathComponent("approval-leases.json", isDirectory: false)
     }
 
+    @discardableResult
     public func authorize(
         agent: String,
         command: ResolvedWrappedCommand,
@@ -1068,7 +1094,7 @@ public actor ApprovalCache {
         policyFingerprint: String,
         reason: String,
         authenticator: DeviceAuthenticator
-    ) async throws {
+    ) async throws -> ApprovalAuthorizationOutcome {
         let currentDate = now()
         let key = ApprovalLeaseRecord(
             agent: agent,
@@ -1081,7 +1107,7 @@ public actor ApprovalCache {
 
         if let expiration = expirations[key], expiration > currentDate {
             debug("approval_cache_hit source=memory command=\(command.name) agent=\(agent)")
-            return
+            return .cacheHitMemory
         }
 
         let match = try command.approvalWindowSeconds > 0 ? loadMatchingLease(
@@ -1094,7 +1120,7 @@ public actor ApprovalCache {
         if let lease = match.lease {
             expirations[key] = lease.expiresAt
             debug("approval_cache_hit source=file command=\(command.name) agent=\(agent)")
-            return
+            return match.source ?? .cacheHitFile
         }
 
         debug("approval_cache_miss reason=\(match.reason.rawValue) command=\(command.name) agent=\(agent)")
@@ -1114,6 +1140,7 @@ public actor ApprovalCache {
         } else {
             expirations.removeValue(forKey: key)
         }
+        return .prompted
     }
 
     private func loadMatchingLease(
@@ -1148,7 +1175,7 @@ public actor ApprovalCache {
             $0.policyFingerprint == policyFingerprint &&
             $0.expiresAt > currentDate
         }) {
-            return ApprovalLeaseMatch(lease: lease, reason: .hit)
+            return ApprovalLeaseMatch(lease: lease, reason: .hit, source: .cacheHitFile)
         }
 
         if file.leases.contains(where: { $0.command == command.name && $0.executablePath == executableURL.path && $0.policyFingerprint == policyFingerprint }) {
@@ -1337,6 +1364,230 @@ public final class ProcessCommandExecutor: CommandExecutor, @unchecked Sendable 
     }
 }
 
+public struct ToolDecisionMatchedPolicy: Codable, Equatable, Sendable {
+    public let commandName: String
+    public let command: String
+    public let executablePath: String?
+    public let policyFingerprint: String?
+    public let approvalWindowSeconds: Int
+    public let timeoutSeconds: Int
+    public let maxOutputBytes: Int
+    public let denyPrefixes: [[String]]
+    public let allowPrefixes: [[String]]
+    public let denyFlags: [String]
+
+    public init(
+        commandName: String,
+        command: String,
+        executablePath: String?,
+        policyFingerprint: String?,
+        approvalWindowSeconds: Int,
+        timeoutSeconds: Int,
+        maxOutputBytes: Int,
+        denyPrefixes: [[String]],
+        allowPrefixes: [[String]],
+        denyFlags: [String]
+    ) {
+        self.commandName = commandName
+        self.command = command
+        self.executablePath = executablePath
+        self.policyFingerprint = policyFingerprint
+        self.approvalWindowSeconds = approvalWindowSeconds
+        self.timeoutSeconds = timeoutSeconds
+        self.maxOutputBytes = maxOutputBytes
+        self.denyPrefixes = denyPrefixes
+        self.allowPrefixes = allowPrefixes
+        self.denyFlags = denyFlags
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case commandName = "command_name"
+        case command
+        case executablePath = "executable_path"
+        case policyFingerprint = "policy_fingerprint"
+        case approvalWindowSeconds = "approval_window_seconds"
+        case timeoutSeconds = "timeout_seconds"
+        case maxOutputBytes = "max_output_bytes"
+        case denyPrefixes = "deny_prefixes"
+        case allowPrefixes = "allow_prefixes"
+        case denyFlags = "deny_flags"
+    }
+}
+
+public struct ToolDecisionOutputMetadata: Codable, Equatable, Sendable {
+    public let stdoutBytes: Int
+    public let stderrBytes: Int
+    public let stdoutSHA256: String
+    public let stderrSHA256: String
+
+    public init(stdout: Data, stderr: Data) {
+        self.stdoutBytes = stdout.count
+        self.stderrBytes = stderr.count
+        self.stdoutSHA256 = "sha256:\(sha256Hex(stdout))"
+        self.stderrSHA256 = "sha256:\(sha256Hex(stderr))"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stdoutBytes = "stdout_bytes"
+        case stderrBytes = "stderr_bytes"
+        case stdoutSHA256 = "stdout_sha256"
+        case stderrSHA256 = "stderr_sha256"
+    }
+}
+
+public struct ToolDecisionRedactionMetadata: Codable, Equatable, Sendable {
+    public let stdout: String
+    public let stderr: String
+    public let rawSecretMCPCRUDAvailable: Bool
+
+    public init(
+        stdout: String = "not_redacted_broker_response",
+        stderr: String = "not_redacted_broker_response",
+        rawSecretMCPCRUDAvailable: Bool = false
+    ) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.rawSecretMCPCRUDAvailable = rawSecretMCPCRUDAvailable
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stdout
+        case stderr
+        case rawSecretMCPCRUDAvailable = "raw_secret_mcp_crud_available"
+    }
+}
+
+public struct ToolDecisionReceipt: Codable, Equatable, Sendable {
+    public let schemaVersion: String
+    public let receiptID: String
+    public let surface: String
+    public let toolName: String
+    public let commandName: String?
+    public let argv: [String]
+    public let cwd: String?
+    public let requester: String?
+    public let matchedPolicy: ToolDecisionMatchedPolicy?
+    public let decision: String
+    public let approvalState: ApprovalAuthorizationOutcome
+    public let startedAt: String
+    public let completedAt: String
+    public let exitCode: Int32?
+    public let stdoutTruncated: Bool
+    public let stderrTruncated: Bool
+    public let output: ToolDecisionOutputMetadata?
+    public let redaction: ToolDecisionRedactionMetadata
+    public let error: String?
+
+    public init(
+        schemaVersion: String = "aegis.tool_decision_receipt.v1",
+        receiptID: String = UUID().uuidString,
+        surface: String,
+        toolName: String,
+        commandName: String?,
+        argv: [String],
+        cwd: String?,
+        requester: String?,
+        matchedPolicy: ToolDecisionMatchedPolicy?,
+        decision: String,
+        approvalState: ApprovalAuthorizationOutcome,
+        startedAt: String,
+        completedAt: String,
+        exitCode: Int32?,
+        stdoutTruncated: Bool,
+        stderrTruncated: Bool,
+        output: ToolDecisionOutputMetadata?,
+        redaction: ToolDecisionRedactionMetadata = ToolDecisionRedactionMetadata(),
+        error: String?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.receiptID = receiptID
+        self.surface = surface
+        self.toolName = toolName
+        self.commandName = commandName
+        self.argv = argv
+        self.cwd = cwd
+        self.requester = requester
+        self.matchedPolicy = matchedPolicy
+        self.decision = decision
+        self.approvalState = approvalState
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.exitCode = exitCode
+        self.stdoutTruncated = stdoutTruncated
+        self.stderrTruncated = stderrTruncated
+        self.output = output
+        self.redaction = redaction
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case receiptID = "receipt_id"
+        case surface
+        case toolName = "tool_name"
+        case commandName = "command_name"
+        case argv
+        case cwd
+        case requester
+        case matchedPolicy = "matched_policy"
+        case decision
+        case approvalState = "approval_state"
+        case startedAt = "started_at"
+        case completedAt = "completed_at"
+        case exitCode = "exit_code"
+        case stdoutTruncated = "stdout_truncated"
+        case stderrTruncated = "stderr_truncated"
+        case output
+        case redaction
+        case error
+    }
+}
+
+public struct ToolDecisionReceiptRecorder: @unchecked Sendable {
+    public let fileURL: URL?
+    public let fileManager: FileManager
+
+    public init(
+        fileURL: URL? = ToolDecisionReceiptRecorder.defaultURL(),
+        fileManager: FileManager = .default
+    ) {
+        self.fileURL = fileURL
+        self.fileManager = fileManager
+    }
+
+    public static func defaultURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
+        if let override = environment[receiptsFileEnvironmentKey]?.trimmedNonEmpty {
+            if ["0", "false", "off", "none"].contains(override.lowercased()) {
+                return nil
+            }
+            return URL(fileURLWithPath: expandUserPath(override))
+        }
+
+        return CommandStore.defaultConfigDirectory(environment: environment)
+            .appendingPathComponent("tool-decisions.jsonl", isDirectory: false)
+    }
+
+    public func record(_ receipt: ToolDecisionReceipt) throws {
+        guard let fileURL else {
+            return
+        }
+
+        try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            fileManager.createFile(atPath: fileURL.path, contents: nil)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(receipt)
+        let handle = try FileHandle(forWritingTo: fileURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.write(contentsOf: Data([0x0A]))
+    }
+}
+
 public struct WrappedCommandInvocationResult: Codable, Equatable, Sendable {
     public let exitCode: Int32
     public let stdout: String
@@ -1344,6 +1595,7 @@ public struct WrappedCommandInvocationResult: Codable, Equatable, Sendable {
     public let stdoutJSON: JSONValue?
     public let stdoutTruncated: Bool
     public let stderrTruncated: Bool
+    public let receipt: ToolDecisionReceipt
 
     public init(
         exitCode: Int32,
@@ -1351,7 +1603,8 @@ public struct WrappedCommandInvocationResult: Codable, Equatable, Sendable {
         stderr: String,
         stdoutJSON: JSONValue?,
         stdoutTruncated: Bool,
-        stderrTruncated: Bool
+        stderrTruncated: Bool,
+        receipt: ToolDecisionReceipt
     ) {
         self.exitCode = exitCode
         self.stdout = stdout
@@ -1359,6 +1612,7 @@ public struct WrappedCommandInvocationResult: Codable, Equatable, Sendable {
         self.stdoutJSON = stdoutJSON
         self.stdoutTruncated = stdoutTruncated
         self.stderrTruncated = stderrTruncated
+        self.receipt = receipt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1368,6 +1622,7 @@ public struct WrappedCommandInvocationResult: Codable, Equatable, Sendable {
         case stdoutJSON = "stdout_json"
         case stdoutTruncated = "stdout_truncated"
         case stderrTruncated = "stderr_truncated"
+        case receipt
     }
 }
 
@@ -1396,8 +1651,10 @@ public struct WrappedCommandRunner: Sendable {
         name: String,
         args: [String],
         cwd: String? = nil,
-        requester: String? = nil
+        requester: String? = nil,
+        surface: String = "cli"
     ) async throws -> WrappedCommandInvocationResult {
+        let startedAt = Date()
         let wrappedCommand = try commandStore.resolvedCommand(named: name)
         try validate(args: args, for: wrappedCommand)
 
@@ -1409,7 +1666,7 @@ public struct WrappedCommandRunner: Sendable {
         let requesterLabel = requester?.trimmedNonEmpty ?? "the local agent"
         let reason = "Allow \(requesterLabel) to run wrapped command '\(wrappedCommand.name)'."
         let policyFingerprint = try approvalPolicyFingerprint(for: wrappedCommand, executableURL: executableURL)
-        try await approvalCache.authorize(
+        let approvalState = try await approvalCache.authorize(
             agent: requesterLabel,
             command: wrappedCommand,
             executableURL: executableURL,
@@ -1437,6 +1694,28 @@ public struct WrappedCommandRunner: Sendable {
         let stdout = String(decoding: rawResult.stdout, as: UTF8.self)
         let stderr = String(decoding: rawResult.stderr, as: UTF8.self)
         let stdoutJSON = try decodeJSONIfPresent(rawResult.stdout)
+        let receipt = ToolDecisionReceipt(
+            surface: surface,
+            toolName: "run_command",
+            commandName: wrappedCommand.name,
+            argv: [executableURL.path] + args,
+            cwd: workingDirectoryURL?.path,
+            requester: requesterLabel,
+            matchedPolicy: matchedPolicy(
+                for: wrappedCommand,
+                executableURL: executableURL,
+                policyFingerprint: policyFingerprint
+            ),
+            decision: "allow",
+            approvalState: approvalState,
+            startedAt: iso8601String(startedAt),
+            completedAt: iso8601String(Date()),
+            exitCode: rawResult.exitCode,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            output: ToolDecisionOutputMetadata(stdout: rawResult.stdout, stderr: rawResult.stderr),
+            error: nil
+        )
 
         return WrappedCommandInvocationResult(
             exitCode: rawResult.exitCode,
@@ -1444,7 +1723,73 @@ public struct WrappedCommandRunner: Sendable {
             stderr: stderr,
             stdoutJSON: stdoutJSON,
             stdoutTruncated: false,
-            stderrTruncated: false
+            stderrTruncated: false,
+            receipt: receipt
+        )
+    }
+
+    public func deniedReceipt(
+        name: String,
+        args: [String],
+        cwd: String?,
+        requester: String?,
+        surface: String,
+        error: String,
+        startedAt: Date = Date()
+    ) -> ToolDecisionReceipt {
+        let requesterLabel = requester?.trimmedNonEmpty ?? "the local agent"
+        var matchedPolicy: ToolDecisionMatchedPolicy?
+        var argv = [name] + args
+
+        if let wrappedCommand = try? commandStore.resolvedCommand(named: name) {
+            let executableURL = commandStore.resolveExecutable(named: wrappedCommand.command)
+            let policyFingerprint = executableURL.flatMap { try? approvalPolicyFingerprint(for: wrappedCommand, executableURL: $0) }
+            matchedPolicy = self.matchedPolicy(
+                for: wrappedCommand,
+                executableURL: executableURL,
+                policyFingerprint: policyFingerprint
+            )
+            if let executableURL {
+                argv = [executableURL.path] + args
+            }
+        }
+
+        return ToolDecisionReceipt(
+            surface: surface,
+            toolName: "run_command",
+            commandName: name,
+            argv: argv,
+            cwd: cwd,
+            requester: requesterLabel,
+            matchedPolicy: matchedPolicy,
+            decision: "deny",
+            approvalState: matchedPolicy == nil ? .notEvaluated : .deniedByPolicy,
+            startedAt: iso8601String(startedAt),
+            completedAt: iso8601String(Date()),
+            exitCode: nil,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            output: nil,
+            error: error
+        )
+    }
+
+    private func matchedPolicy(
+        for command: ResolvedWrappedCommand,
+        executableURL: URL?,
+        policyFingerprint: String?
+    ) -> ToolDecisionMatchedPolicy {
+        ToolDecisionMatchedPolicy(
+            commandName: command.name,
+            command: command.command,
+            executablePath: executableURL?.path,
+            policyFingerprint: policyFingerprint,
+            approvalWindowSeconds: command.approvalWindowSeconds,
+            timeoutSeconds: command.timeoutSeconds,
+            maxOutputBytes: command.maxOutputBytes,
+            denyPrefixes: command.denyPrefixes,
+            allowPrefixes: command.allowPrefixes,
+            denyFlags: command.denyFlags.sorted()
         )
     }
 

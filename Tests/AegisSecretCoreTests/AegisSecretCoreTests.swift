@@ -368,11 +368,127 @@ final class AegisSecretCoreTests: XCTestCase {
 
         let first = try await runner.run(name: "gh", args: ["api", "/user"], requester: "Claude")
         XCTAssertEqual(first.stdoutJSON, JSONValue.object(["login": JSONValue.string("olympum")]))
+        XCTAssertEqual(first.receipt.approvalState, .prompted)
 
-        _ = try await runner.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        let second = try await runner.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        XCTAssertEqual(second.receipt.approvalState, .cacheHitMemory)
         let reasons = await authenticator.snapshot()
         XCTAssertEqual(reasons.count, 1)
         XCTAssertTrue(reasons[0].contains("wrapped command 'gh'"))
+    }
+
+    func testRunnerIncludesToolDecisionReceipt() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, approvalWindowSeconds: 300)
+            ])
+        ).write(to: commandFile)
+
+        let runner = WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.arguments, ["api", "/user"])
+                return RawCommandExecutionResult(
+                    stdout: Data(#"{"login":"olympum"}"#.utf8),
+                    stderr: Data("notice\n".utf8),
+                    exitCode: 0
+                )
+            }
+        )
+
+        let result = try await runner.run(
+            name: "gh",
+            args: ["api", "/user"],
+            requester: "Codex",
+            surface: "mcp"
+        )
+
+        XCTAssertEqual(result.receipt.schemaVersion, "aegis.tool_decision_receipt.v1")
+        XCTAssertEqual(result.receipt.surface, "mcp")
+        XCTAssertEqual(result.receipt.toolName, "run_command")
+        XCTAssertEqual(result.receipt.commandName, "gh")
+        XCTAssertEqual(result.receipt.argv, [executablePath.path, "api", "/user"])
+        XCTAssertEqual(result.receipt.requester, "Codex")
+        XCTAssertEqual(result.receipt.decision, "allow")
+        XCTAssertEqual(result.receipt.approvalState, .prompted)
+        XCTAssertEqual(result.receipt.exitCode, 0)
+        XCTAssertEqual(result.receipt.stdoutTruncated, false)
+        XCTAssertEqual(result.receipt.stderrTruncated, false)
+        XCTAssertEqual(result.receipt.output?.stdoutBytes, 19)
+        XCTAssertEqual(result.receipt.output?.stderrBytes, 7)
+        XCTAssertTrue(result.receipt.output?.stdoutSHA256.hasPrefix("sha256:") == true)
+        XCTAssertEqual(result.receipt.redaction.rawSecretMCPCRUDAvailable, false)
+        XCTAssertEqual(result.receipt.matchedPolicy?.commandName, "gh")
+        XCTAssertEqual(result.receipt.matchedPolicy?.executablePath, executablePath.path)
+        XCTAssertNotNil(result.receipt.matchedPolicy?.policyFingerprint)
+    }
+
+    func testReceiptRecorderWritesJSONL() throws {
+        let tempDirectory = try temporaryDirectory()
+        let receiptURL = tempDirectory.appendingPathComponent("tool-decisions.jsonl")
+        let recorder = ToolDecisionReceiptRecorder(fileURL: receiptURL)
+        let receipt = ToolDecisionReceipt(
+            receiptID: "receipt-1",
+            surface: "mcp",
+            toolName: "list_commands",
+            commandName: nil,
+            argv: [],
+            cwd: nil,
+            requester: "Codex",
+            matchedPolicy: nil,
+            decision: "allow",
+            approvalState: .notRequired,
+            startedAt: "2026-05-25T12:00:00Z",
+            completedAt: "2026-05-25T12:00:00Z",
+            exitCode: nil,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            output: nil,
+            error: nil
+        )
+
+        try recorder.record(receipt)
+        try recorder.record(receipt)
+
+        let lines = try String(contentsOf: receiptURL, encoding: .utf8)
+            .split(separator: "\n")
+        XCTAssertEqual(lines.count, 2)
+        let decoded = try JSONDecoder().decode(ToolDecisionReceipt.self, from: Data(lines[0].utf8))
+        XCTAssertEqual(decoded, receipt)
+    }
+
+    func testDeniedRunReceiptCarriesPolicyContext() throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "gh", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gh", command: executablePath.path, denyPrefixes: [["auth"]])
+            ])
+        ).write(to: commandFile)
+
+        let runner = WrappedCommandRunner(commandStore: CommandStore(fileURL: commandFile))
+        let receipt = runner.deniedReceipt(
+            name: "gh",
+            args: ["auth", "token"],
+            cwd: tempDirectory.path,
+            requester: "Codex",
+            surface: "mcp",
+            error: "The `auth` subcommand is not allowed."
+        )
+
+        XCTAssertEqual(receipt.decision, "deny")
+        XCTAssertEqual(receipt.approvalState, .deniedByPolicy)
+        XCTAssertEqual(receipt.argv, [executablePath.path, "auth", "token"])
+        XCTAssertEqual(receipt.cwd, tempDirectory.path)
+        XCTAssertEqual(receipt.error, "The `auth` subcommand is not allowed.")
+        XCTAssertEqual(receipt.matchedPolicy?.denyPrefixes, [["auth"]])
+        XCTAssertNil(receipt.output)
     }
 
     func testRunnerReusesPersistedApprovalAcrossCachesForSameAgent() async throws {
@@ -405,12 +521,14 @@ final class AegisSecretCoreTests: XCTestCase {
             }
         )
 
-        _ = try await runner1.run(name: "gh", args: ["api", "/user"], requester: "Claude")
-        _ = try await runner2.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        let first = try await runner1.run(name: "gh", args: ["api", "/user"], requester: "Claude")
+        let second = try await runner2.run(name: "gh", args: ["api", "/user"], requester: "Claude")
 
         let reasons = await authenticator.snapshot()
         XCTAssertEqual(reasons.count, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: leaseFile.path))
+        XCTAssertEqual(first.receipt.approvalState, .prompted)
+        XCTAssertEqual(second.receipt.approvalState, .cacheHitFile)
     }
 
     func testPersistedApprovalDoesNotCrossAgents() async throws {

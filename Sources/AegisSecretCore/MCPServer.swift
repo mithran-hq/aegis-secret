@@ -2,6 +2,7 @@ import Foundation
 
 private struct ToolErrorPayload: Codable {
     let error: String
+    let receipt: ToolDecisionReceipt?
 }
 
 public enum JSONValue: Codable, Equatable, Sendable {
@@ -128,19 +129,27 @@ private struct ToolCallResult<Payload: Encodable>: Encodable {
     let isError: Bool
 }
 
+private struct ListCommandsToolResponse: Encodable {
+    let commands: [WrappedCommandSummary]
+    let receipt: ToolDecisionReceipt
+}
+
 public final class StdioMCPServer {
     private let commandStore: CommandStore
     private let runner: WrappedCommandRunner
     private let agentName: String?
+    private let receiptRecorder: ToolDecisionReceiptRecorder
 
     public init(
         commandStore: CommandStore = CommandStore(),
         runner: WrappedCommandRunner? = nil,
-        agentName: String? = ProcessInfo.processInfo.environment["AEGIS_SECRET_AGENT_NAME"]
+        agentName: String? = ProcessInfo.processInfo.environment["AEGIS_SECRET_AGENT_NAME"],
+        receiptRecorder: ToolDecisionReceiptRecorder = ToolDecisionReceiptRecorder()
     ) {
         self.commandStore = commandStore
         self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore)
         self.agentName = agentName
+        self.receiptRecorder = receiptRecorder
     }
 
     public func run() async {
@@ -204,7 +213,28 @@ public final class StdioMCPServer {
         do {
             switch name {
             case "list_commands":
-                try emitToolResult(id: id, payload: ["commands": try commandStore.listCommands()])
+                let startedAt = Date()
+                let commands = try commandStore.listCommands()
+                let receipt = ToolDecisionReceipt(
+                    surface: "mcp",
+                    toolName: "list_commands",
+                    commandName: nil,
+                    argv: [],
+                    cwd: nil,
+                    requester: agentName,
+                    matchedPolicy: nil,
+                    decision: "allow",
+                    approvalState: .notRequired,
+                    startedAt: iso8601String(startedAt),
+                    completedAt: iso8601String(Date()),
+                    exitCode: nil,
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                    output: nil,
+                    error: nil
+                )
+                try? receiptRecorder.record(receipt)
+                try emitToolResult(id: id, payload: ListCommandsToolResponse(commands: commands, receipt: receipt))
             case "run_command":
                 guard let commandName = arguments["name"]?.stringValue else {
                     try emitToolError(id: id, message: "Missing `name`.")
@@ -213,16 +243,53 @@ public final class StdioMCPServer {
                 let args = try decodeArgs(arguments["args"])
                 let cwd = arguments["cwd"]?.stringValue
                 let requester = arguments["requester"]?.stringValue ?? agentName ?? "MCP client"
-                let result = try await runner.run(name: commandName, args: args, cwd: cwd, requester: requester)
+                let result = try await runner.run(
+                    name: commandName,
+                    args: args,
+                    cwd: cwd,
+                    requester: requester,
+                    surface: "mcp"
+                )
+                try? receiptRecorder.record(result.receipt)
                 try emitToolResult(id: id, payload: result)
             default:
                 try emitToolError(id: id, message: "Unknown tool `\(name)`.")
             }
         } catch let error as AegisSecretError {
-            try emitToolError(id: id, message: error.description)
+            let receipt = deniedRunReceiptIfPossible(toolName: name, arguments: arguments, message: error.description)
+            if let receipt {
+                try? receiptRecorder.record(receipt)
+            }
+            try emitToolError(id: id, message: error.description, receipt: receipt)
         } catch {
-            try emitToolError(id: id, message: error.localizedDescription)
+            let receipt = deniedRunReceiptIfPossible(toolName: name, arguments: arguments, message: error.localizedDescription)
+            if let receipt {
+                try? receiptRecorder.record(receipt)
+            }
+            try emitToolError(id: id, message: error.localizedDescription, receipt: receipt)
         }
+    }
+
+    private func deniedRunReceiptIfPossible(
+        toolName: String,
+        arguments: [String: JSONValue],
+        message: String
+    ) -> ToolDecisionReceipt? {
+        guard toolName == "run_command", let commandName = arguments["name"]?.stringValue else {
+            return nil
+        }
+
+        let args = (try? decodeArgs(arguments["args"])) ?? []
+        let cwd = arguments["cwd"]?.stringValue
+        let requester = arguments["requester"]?.stringValue ?? agentName ?? "MCP client"
+        return runner.deniedReceipt(
+            name: commandName,
+            args: args,
+            cwd: cwd,
+            requester: requester,
+            surface: "mcp",
+            error: message
+        )
     }
 
     private func toolDescriptors() -> [ToolDescriptor] {
@@ -240,6 +307,9 @@ public final class StdioMCPServer {
                     "properties": .object([
                         "commands": .object([
                             "type": .string("array")
+                        ]),
+                        "receipt": .object([
+                            "description": .string("D37-compatible decision receipt written to the local JSONL handoff file.")
                         ])
                     ]),
                 ]
@@ -282,6 +352,7 @@ public final class StdioMCPServer {
                         "stdout_json": .object(["description": .string("Parsed stdout when stdout is valid JSON.")]),
                         "stdout_truncated": .object(["type": .string("boolean")]),
                         "stderr_truncated": .object(["type": .string("boolean")]),
+                        "receipt": .object(["description": .string("D37-compatible decision receipt written to the local JSONL handoff file.")]),
                     ]),
                 ]
             ),
@@ -315,12 +386,12 @@ public final class StdioMCPServer {
         ))
     }
 
-    private func emitToolError(id: JSONValue?, message: String) throws {
+    private func emitToolError(id: JSONValue?, message: String, receipt: ToolDecisionReceipt? = nil) throws {
         try emit(RPCResponse(
             id: id,
             result: ToolCallResult(
                 content: [ToolContent(type: "text", text: "Error: \(message)")],
-                structuredContent: ToolErrorPayload(error: message),
+                structuredContent: ToolErrorPayload(error: message, receipt: receipt),
                 isError: true
             ),
             error: nil

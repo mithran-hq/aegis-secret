@@ -67,6 +67,8 @@ Agents get only the brokered command tools:
 That means an agent can discover which local tools Aegis Broker can run when a
 protected action requires MCP. Ordinary commands are not brokered by default. It
 does not get `get_secret`, `set_secret`, or `delete_secret` over MCP.
+MCP decisions are written as local JSONL receipts for the Aegis daemon; see
+`docs/tool-decision-receipts.md`.
 
 ## Quick Start
 
