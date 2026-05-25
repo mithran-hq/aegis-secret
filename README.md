@@ -2,19 +2,20 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Aegis Secret allows agents to use local developer tools such as `gh`, `aws`,
-`gcloud`, `kubectl`, `terraform`, and `az`, but without them freely shelling
-out to those tools and asking or using raw credentials.
+Aegis Secret stores local secrets in the macOS Keychain with biometric approval.
+Aegis Broker is the protected-tool alias that gates selected privileged actions
+without making ordinary commands go through MCP by default.
 
-Aegis sits between the agent and the local CLI:
+Aegis sits between the agent and protected local CLI actions:
 
-- the agent sees a small MCP surface
+- the agent sees a small Broker MCP surface for privileged actions
 - Aegis prompts for Touch ID
-- Aegis runs the real local command directly
+- Aegis runs the real local command directly when brokered execution is required
 - the agent gets the command result, not a raw secret
 
-Wrapped commands are the main product surface. They matter because many useful
-tools already know how to authenticate themselves through existing local state:
+Wrapped commands remain the compatibility MCP surface. Broker policy decides
+when a command needs that path. They matter because many useful tools already
+know how to authenticate themselves through existing local state:
 
 - `gh` may already be logged in
 - `aws` may already have SSO, profile, or role-based auth
@@ -26,8 +27,9 @@ The product model is intentionally simple:
 
 - humans manage raw secrets through the CLI when they need to
 - agents do not get raw secret tools over MCP
-- MCP exposes only wrapped local commands
-- Aegis runs the real CLI directly after approval
+- ordinary commands pass through without Broker MCP by default
+- protected GitHub method mutations are checked by Bruno before execution
+- privileged credentialed commands use Broker MCP and Touch ID approval
 
 Examples:
 
@@ -40,10 +42,11 @@ Examples:
 
 ## What Aegis Does
 
-Aegis has two surfaces:
+Aegis has three surfaces:
 
-- CLI for humans
-- MCP for agents
+- Aegis Secret CLI for humans
+- Aegis Broker MCP for privileged agent actions
+- PreTool hooks for protected-action classification
 
 ### Human CLI
 
@@ -56,14 +59,14 @@ Humans use the CLI to:
 
 ### Agent MCP
 
-Agents get only:
+Agents get only the brokered command tools:
 
 - `list_commands`
 - `run_command`
 
-That means an agent can discover which local tools Aegis allows and then ask
-Aegis to run one of them. It does not get `get_secret`, `set_secret`, or
-`delete_secret` over MCP.
+That means an agent can discover which local tools Aegis Broker can run when a
+protected action requires MCP. Ordinary commands are not brokered by default. It
+does not get `get_secret`, `set_secret`, or `delete_secret` over MCP.
 
 ## Quick Start
 
@@ -87,10 +90,10 @@ aegis-secret run gh -- api /user
 aegis-secret run aws -- sts get-caller-identity --output json
 ```
 
-Let an agent use the MCP server:
+Let an agent use Broker MCP for a privileged action:
 
 1. the agent calls `list_commands`
-2. the agent picks a wrapped command such as `gh`
+2. the agent picks the command requested by the block message
 3. the agent calls `run_command`
 4. you approve with Touch ID
 
@@ -109,6 +112,8 @@ The package installs:
 - `/Applications/Aegis Secret.app`
 - `/usr/local/bin/aegis-secret`
 - `/usr/local/bin/aegis-secret-mcp`
+- `/usr/local/bin/aegis-broker`
+- `/usr/local/bin/aegis-broker-mcp`
 
 The installer also makes a best-effort attempt to run:
 
@@ -127,12 +132,13 @@ That per-user setup step is what creates and refreshes:
   overwrite your edits. Use it to disable shipped commands, override defaults,
   or add new wrapped commands.
 - user-scoped Claude MCP registration
-  Aegis registers itself as a Claude MCP server in the current user account, so
-  new Claude sessions can discover `list_commands` and `run_command` in every
-  project.
+  Aegis registers `aegis-secret` for compatibility and `aegis-broker` for the
+  privileged broker path, so new Claude sessions can discover `list_commands`
+  and `run_command` in every project.
 - user-scoped Codex MCP registration
-  Aegis registers itself as a Codex MCP server in the current user account, so
-  Codex can use the same wrapped-command tools without extra per-repo setup.
+  Aegis registers `aegis-secret` for compatibility and `aegis-broker` for the
+  privileged broker path, so Codex can use the same tools without extra
+  per-repo setup.
 - user-scoped shell-bypass guard hooks, when agent config files are present
   - `~/.claude/settings.json`
     Aegis installs a `PreToolUse` hook for Claude `Bash` calls. The hook runs
@@ -142,11 +148,11 @@ That per-user setup step is what creates and refreshes:
     calls. Codex may ask you to review and trust a newly installed user hook.
 - the managed Aegis block in:
   - `~/.claude/CLAUDE.md`
-    Aegis updates only its marked block there, telling Claude to prefer
-    `list_commands` and `run_command` for wrapped tools.
+    Aegis updates only its marked block there, telling Claude when to use
+    Broker MCP for privileged actions.
   - `~/.codex/AGENTS.md`
-    Aegis updates only its marked block there, telling Codex to prefer
-    `list_commands` and `run_command` for wrapped tools.
+    Aegis updates only its marked block there, telling Codex when to use
+    Broker MCP for privileged actions.
 
 If that best-effort step did not run, or if you want to repair user setup at
 any time, run:
@@ -166,8 +172,9 @@ Out of the box, Aegis ships wrappers for:
 - `terraform`
 - `az`
 
-The shipped defaults are permissive enough to work out of the box, but include
-obvious deny rules for credential and auth-management paths.
+The wrapped-command defaults remain for compatibility and brokered privileged
+execution. They include obvious deny rules for credential and auth-management
+paths.
 
 Examples:
 
@@ -176,7 +183,7 @@ Examples:
 - `aws ecr get-login-password` is blocked
 - `gcloud auth ...` is blocked
 - `kubectl apply ...` is blocked
-- `terraform apply` is blocked
+- `terraform apply` requires the brokered privileged path
 - `az login` is blocked
 
 Wrapped command names are the top-level whitelist. If `kubectl` is not
@@ -227,21 +234,21 @@ aegis-secret command validate --file examples/commands.example.json
 
 ## Expected Agent Behavior
 
-After `install-user`, Claude and Codex should prefer Aegis for wrapped tools.
+After `install-user`, Claude and Codex should use Aegis Broker only when the
+hook or task requires brokered privileged execution.
 
 Expected agent flow:
 
-1. call `list_commands`
-2. see whether a tool such as `gh`, `aws`, `gcloud`, `kubectl`, `terraform`, or `az` is wrapped
-3. use `run_command` instead of calling that CLI directly through Bash
-4. fall back to direct shell use only when the command is not wrapped
+1. run ordinary commands through the normal tool path
+2. let the PreTool hook check protected GitHub method mutations before they run
+3. when blocked for privileged execution, call `list_commands`
+4. use `run_command` for the requested brokered command
 
-If the agent calls a wrapped command through the shell anyway, the installed
-Claude/Codex hook runs `aegis-secret guard shell`. A direct command such as
-`gh issue list`, an env-prefixed command such as `FOO=1 gh api /user`, a
-compound command such as `git status && gh issue list`, and
-`aegis-secret run gh -- ...` are blocked with exit code `2`. The feedback tells
-the agent to use the Aegis MCP `list_commands` and `run_command` tools.
+If the agent calls a protected or privileged command through the shell, the
+installed Claude/Codex hook runs `aegis-secret guard shell`. Protected GitHub
+method mutations may be checked by Bruno. Privileged credentialed commands may
+be blocked with exit code `2`, and the feedback tells the agent to use Aegis
+Broker MCP `list_commands` and `run_command`.
 
 Expected behavior for denied commands:
 
@@ -302,6 +309,8 @@ aegis-secret command import <json-file>
 aegis-secret approval status [<command>] [--agent <agent>]
 aegis-secret guard shell [--command <shell-command>]
 aegis-secret run <name> -- <args...>
+aegis-broker ...
+aegis-broker-mcp ...
 ```
 
 ## Security Model
@@ -327,7 +336,7 @@ Use these checks before a release or after changing approval or hook behavior:
 ```bash
 swift test
 ./scripts/ci_local.sh
-.build/debug/aegis-secret guard shell --command 'gh issue list'
+.build/debug/aegis-secret guard shell --command 'terraform apply'
 ```
 
 Expected smoke results:
@@ -336,8 +345,7 @@ Expected smoke results:
   expiry, policy changes, executable path changes, hook JSON extraction, and
   idempotent Claude/Codex hook updates.
 - `./scripts/ci_local.sh` passes.
-- direct shell guard smoke prints a message telling the agent to use
-  `list_commands` and `run_command`, then exits `2`.
+- direct shell guard smoke blocks the privileged command and exits `2`.
 - MCP allow smoke succeeds when an agent uses Aegis MCP `list_commands` followed
   by `run_command` for an allowed wrapped command, such as `gh api /user`.
 

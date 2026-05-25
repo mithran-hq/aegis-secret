@@ -65,15 +65,15 @@ Install:
 2. Open the package and complete the installer
 
 The installer places \`Aegis Secret.app\` in \`/Applications\`, installs
-\`aegis-secret\` and \`aegis-secret-mcp\` in \`/usr/local/bin\`, and makes a
-best-effort attempt to:
+\`aegis-secret\`, \`aegis-secret-mcp\`, \`aegis-broker\`, and
+\`aegis-broker-mcp\` in \`/usr/local/bin\`, and makes a best-effort attempt to:
 
 - register user-scoped MCP integration for Codex and Claude
 - refresh \`~/.config/aegis-secret/commands.base.json\`
 - create \`~/.config/aegis-secret/commands.local.json\` if needed
 - refresh the managed Aegis block in \`~/.claude/CLAUDE.md\` and \`~/.codex/AGENTS.md\`
 
-If you need to repair the per-user MCP registration later, run:
+To repair the per-user MCP registration, run:
 
 \`\`\`bash
 aegis-secret install-user

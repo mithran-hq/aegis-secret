@@ -2052,13 +2052,22 @@ public struct CLIApplication {
             if installation.registeredClaude {
                 print("Registered the Claude MCP server.")
             }
+            if installation.registeredCodexBroker {
+                print("Registered the Codex Aegis Broker MCP alias.")
+            }
+            if installation.registeredClaudeBroker {
+                print("Registered the Claude Aegis Broker MCP alias.")
+            }
             if installation.installedCodexHook {
                 print("Installed the managed Codex shell-bypass guard hook.")
             }
             if installation.installedClaudeHook {
                 print("Installed the managed Claude shell-bypass guard hook.")
             }
-            if !installation.registeredCodex && !installation.registeredClaude {
+            if !installation.registeredCodex
+                && !installation.registeredClaude
+                && !installation.registeredCodexBroker
+                && !installation.registeredClaudeBroker {
                 print("No supported MCP client CLI was found, so only PATH shims were created.")
             }
             if installation.updatedCodexGuidance {
@@ -2230,6 +2239,8 @@ public struct UserInstallationSummary {
     public let appBundleURL: URL
     public let registeredCodex: Bool
     public let registeredClaude: Bool
+    public let registeredCodexBroker: Bool
+    public let registeredClaudeBroker: Bool
     public let installedCodexHook: Bool
     public let installedClaudeHook: Bool
     public let updatedCodexGuidance: Bool
@@ -2416,10 +2427,23 @@ public struct UserInstaller {
             arguments: ["--mcp-server"],
             in: binDirectory
         )
+        try writeShim(
+            named: "aegis-broker",
+            targetExecutable: executableURL,
+            arguments: [],
+            in: binDirectory
+        )
+        try writeShim(
+            named: "aegis-broker-mcp",
+            targetExecutable: executableURL,
+            arguments: ["--mcp-server"],
+            in: binDirectory
+        )
 
-        let serverName = "aegis-secret"
-        let registeredCodex = try registerCodex(serverName: serverName, executableURL: executableURL)
-        let registeredClaude = try registerClaude(serverName: serverName, executableURL: executableURL)
+        let registeredCodex = try registerCodex(serverName: "aegis-secret", executableURL: executableURL)
+        let registeredClaude = try registerClaude(serverName: "aegis-secret", executableURL: executableURL)
+        let registeredCodexBroker = try registerCodex(serverName: "aegis-broker", executableURL: executableURL)
+        let registeredClaudeBroker = try registerClaude(serverName: "aegis-broker", executableURL: executableURL)
         let installedCodexHook = registeredCodex ? try installCodexHook(executableURL: executableURL) : false
         let installedClaudeHook = registeredClaude ? try installClaudeHook(executableURL: executableURL) : false
         let updatedCodexGuidance = try updateCodexGuidance()
@@ -2429,6 +2453,8 @@ public struct UserInstaller {
             appBundleURL: appBundleURL,
             registeredCodex: registeredCodex,
             registeredClaude: registeredClaude,
+            registeredCodexBroker: registeredCodexBroker,
+            registeredClaudeBroker: registeredClaudeBroker,
             installedCodexHook: installedCodexHook,
             installedClaudeHook: installedClaudeHook,
             updatedCodexGuidance: updatedCodexGuidance,
@@ -2674,30 +2700,30 @@ public struct UserInstaller {
 }
 
 private let defaultClaudeGuidance = """
-## Aegis Secret
+## Aegis Secret / Aegis Broker
 
-When a task involves local CLIs such as `gh`, `aws`, `gcloud`, `kubectl`, or similar tools, prefer the `aegis-secret` MCP server when it is available.
+Use ordinary shell calls for ordinary commands. Use Aegis Broker only for protected or privileged actions.
 
-- Call `list_commands` first to discover which wrapped commands Aegis exposes.
-- Use `run_command` for wrapped tools instead of invoking those CLIs directly through Bash.
-- Treat Aegis as the default path for wrapped local tools, not as a fallback after shelling out.
+- Protected GitHub method mutations such as issue close, PR merge, or release edits are checked by the Aegis PreTool hook and Bruno before the original command runs.
+- Privileged credentialed actions such as `terraform apply` must use the Aegis Broker MCP server: call `list_commands`, then `run_command`.
+- Ordinary commands such as `gh issue list`, `terraform plan`, and `git status` are not brokered by default.
 - Use `aegis-secret command list` and `aegis-secret command show <NAME>` only as a local fallback when MCP is unavailable.
-- If a `Bash` call is blocked by `aegis-secret guard shell`, retry through the Aegis MCP `run_command` tool instead of asking for shell approval.
+- If a `Bash` call is blocked by `aegis-secret guard shell`, follow the block message. It may ask for evidence, or it may ask you to retry through Aegis Broker MCP.
 - Aegis approval leases are per agent and wrapped command. The persisted lease identity includes the agent name, command name, resolved executable path, and policy fingerprint.
 - Use `aegis-secret approval status <NAME> --agent Claude` to diagnose repeated approval prompts.
 - Use `aegis-secret get <KEY> --agent Claude` only for explicit human-approved debugging or when the user specifically asks for the raw value.
 """
 
 private let defaultCodexGuidance = """
-## Aegis Secret
+## Aegis Secret / Aegis Broker
 
-When a task involves local CLIs such as `gh`, `aws`, `gcloud`, `kubectl`, or similar tools, prefer the `aegis-secret` MCP server when it is available.
+Use ordinary shell calls for ordinary commands. Use Aegis Broker only for protected or privileged actions.
 
-- Call `list_commands` first to discover which wrapped commands Aegis exposes.
-- Use `run_command` for wrapped tools instead of invoking those CLIs directly through Bash.
-- Treat Aegis as the default path for wrapped local tools, not as a fallback after shelling out.
+- Protected GitHub method mutations such as issue close, PR merge, or release edits are checked by the Aegis PreTool hook and Bruno before the original command runs.
+- Privileged credentialed actions such as `terraform apply` must use the Aegis Broker MCP server: call `list_commands`, then `run_command`.
+- Ordinary commands such as `gh issue list`, `terraform plan`, and `git status` are not brokered by default.
 - Use `aegis-secret command list` and `aegis-secret command show <NAME>` only as a local fallback when MCP is unavailable.
-- If a shell tool call is blocked by `aegis-secret guard shell`, retry through the Aegis MCP `run_command` tool instead of asking for shell approval.
+- If a shell tool call is blocked by `aegis-secret guard shell`, follow the block message. It may ask for evidence, or it may ask you to retry through Aegis Broker MCP.
 - Aegis approval leases are per agent and wrapped command. The persisted lease identity includes the agent name, command name, resolved executable path, and policy fingerprint.
 - Use `aegis-secret approval status <NAME> --agent Codex` to diagnose repeated approval prompts.
 - Use `aegis-secret get <KEY> --agent Codex` only for explicit human-approved debugging or when the user specifically asks for the raw value.

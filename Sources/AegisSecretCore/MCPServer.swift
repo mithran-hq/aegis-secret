@@ -229,8 +229,8 @@ public final class StdioMCPServer {
         [
             ToolDescriptor(
                 name: "list_commands",
-                title: "List wrapped commands",
-                description: "List the local CLIs that Aegis Secret wants agents to use instead of calling those commands directly through Bash. Call this first when a task might use wrapped tools such as gh, aws, or gcloud.",
+                title: "List brokered privileged commands",
+                description: "List the local CLIs that Aegis Broker can run through MCP when a protected or privileged action requires brokered execution. Ordinary commands are not brokered by default.",
                 inputSchema: [
                     "type": .string("object"),
                     "properties": .object([:]),
@@ -246,8 +246,8 @@ public final class StdioMCPServer {
             ),
             ToolDescriptor(
                 name: "run_command",
-                title: "Run wrapped command",
-                description: "Run a configured wrapped command with Touch ID approval. Prefer this over invoking wrapped CLIs such as gh, aws, or gcloud directly through Bash when the command appears in list_commands. Aegis executes the real CLI directly without a shell.",
+                title: "Run brokered command",
+                description: "Run a configured command through Aegis Broker with Touch ID approval and redacted output. Use this for privileged credentialed actions when the PreTool hook requires brokered execution; ordinary commands should use the normal tool path.",
                 inputSchema: [
                     "type": .string("object"),
                     "properties": .object([

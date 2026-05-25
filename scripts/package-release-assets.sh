@@ -40,7 +40,21 @@ cat > "$PKG_ROOT_DIR/usr/local/bin/aegis-secret-mcp" <<'EOF'
 exec '/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret' --mcp-server "$@"
 EOF
 
-chmod 755 "$PKG_ROOT_DIR/usr/local/bin/aegis-secret" "$PKG_ROOT_DIR/usr/local/bin/aegis-secret-mcp"
+cat > "$PKG_ROOT_DIR/usr/local/bin/aegis-broker" <<'EOF'
+#!/bin/zsh
+exec '/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret' "$@"
+EOF
+
+cat > "$PKG_ROOT_DIR/usr/local/bin/aegis-broker-mcp" <<'EOF'
+#!/bin/zsh
+exec '/Applications/Aegis Secret.app/Contents/MacOS/aegis-secret' --mcp-server "$@"
+EOF
+
+chmod 755 \
+  "$PKG_ROOT_DIR/usr/local/bin/aegis-secret" \
+  "$PKG_ROOT_DIR/usr/local/bin/aegis-secret-mcp" \
+  "$PKG_ROOT_DIR/usr/local/bin/aegis-broker" \
+  "$PKG_ROOT_DIR/usr/local/bin/aegis-broker-mcp"
 
 cat > "$POSTINSTALL_PATH" <<'EOF'
 #!/bin/zsh
