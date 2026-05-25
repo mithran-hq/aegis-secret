@@ -14,7 +14,10 @@ VERSION="$(release_version_from_tag "$TAG")"
 DIST_DIR="$(release_dist_dir "$TAG")"
 PKG_PATH="$DIST_DIR/Aegis Secret-$VERSION-installer.pkg"
 CHECKSUMS_PATH="$DIST_DIR/SHA256SUMS"
+COMPONENT_ARCHIVE="$DIST_DIR/aegis-secret-broker-$VERSION-component.tar.gz"
+COMPONENT_MANIFEST="$DIST_DIR/aegis-secret-broker-$VERSION-component.json"
 RELEASE_ASSET_NAME="Aegis.Secret-$VERSION-installer.pkg"
+COMPONENT_ASSET_NAME="aegis-secret-broker-$VERSION-component.tar.gz"
 NOTES_FILE="${AEGIS_SECRET_RELEASE_NOTES_FILE:-}"
 REPOSITORY="${AEGIS_SECRET_GITHUB_REPOSITORY:-$DEFAULT_GITHUB_REPOSITORY}"
 TEMP_NOTES_FILE=""
@@ -26,7 +29,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for required_path in "$PKG_PATH" "$CHECKSUMS_PATH"; do
+for required_path in "$PKG_PATH" "$CHECKSUMS_PATH" "$COMPONENT_ARCHIVE" "$COMPONENT_MANIFEST"; do
   if [[ ! -f "$required_path" ]]; then
     echo "Error: release asset not found: $required_path" >&2
     exit 1
@@ -41,6 +44,8 @@ RELEASE_ARGS=(
   gh release create "$TAG"
   "$PKG_PATH"
   "$CHECKSUMS_PATH"
+  "$COMPONENT_ARCHIVE"
+  "$COMPONENT_MANIFEST"
   --repo "$REPOSITORY"
   --draft
   --target "$(git -C "$ROOT_DIR" rev-parse HEAD)"
@@ -56,6 +61,7 @@ Aegis Secret $VERSION is the latest binary release.
 
 What's included:
 - Notarized macOS installer package
+- Aegis Secret/Broker component artifact for the unified Aegis.app bundle
 - Signed app bundle with Touch ID-gated command access
 - Local MCP server for running wrapped commands such as \`gh\`, \`aws\`, \`gcloud\`, \`kubectl\`, \`terraform\`, and \`az\`
 - CLI for storing secrets and managing wrapped commands
@@ -63,6 +69,10 @@ What's included:
 Install:
 1. Download \`$RELEASE_ASSET_NAME\`
 2. Open the package and complete the installer
+
+Component consumers:
+- \`$COMPONENT_ASSET_NAME\` is the compatibility component artifact for Aegis.app assembly.
+- Normal MAP 1.0 users should install Aegis, not the standalone Aegis Secret package.
 
 The installer places \`Aegis Secret.app\` in \`/Applications\`, installs
 \`aegis-secret\`, \`aegis-secret-mcp\`, \`aegis-broker\`, and

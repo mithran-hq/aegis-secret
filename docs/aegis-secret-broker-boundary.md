@@ -29,6 +29,14 @@ remediation in the local path.
 
 ## MAP 1.0 Packaging
 
+The primary MAP 1.0 user-facing install surface is `Aegis.app` installed by
+`Aegis.pkg`. Aegis Secret/Broker is consumed as a managed component artifact
+inside that bundle.
+
+This repository still builds standalone Aegis Secret packages for compatibility
+and development. Component artifacts for `Aegis.app` are described in
+`docs/component-artifacts.md`.
+
 The installed package exposes these command names:
 
 - `aegis-secret`

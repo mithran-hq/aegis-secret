@@ -99,6 +99,12 @@ Let an agent use Broker MCP for a privileged action:
 
 ## Install
 
+MAP 1.0 normal users should install Aegis. Aegis bundles and manages Aegis
+Secret and Aegis Broker as local runtime components.
+
+The standalone Aegis Secret package remains available for compatibility,
+development, and component release assembly.
+
 ### Binary Release
 
 Download the installer package from the
