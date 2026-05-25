@@ -51,6 +51,14 @@ struct MockCommandExecutor: CommandExecutor {
     }
 }
 
+struct StubBrunoGuardEvaluator: BrunoGuardEvaluating {
+    let handler: @Sendable (JSONValue) async throws -> BrunoGuardDecision
+
+    func evaluate(event: JSONValue) async throws -> BrunoGuardDecision {
+        try await handler(event)
+    }
+}
+
 final class AegisSecretCoreTests: XCTestCase {
     func testHelpWhenNoArguments() throws {
         XCTAssertEqual(try CommandParser().parse([], stdinIsTTY: true), .help)
@@ -691,63 +699,147 @@ final class AegisSecretCoreTests: XCTestCase {
         }
     }
 
-    func testShellGuardBlocksDirectWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "gh issue list")
+    func testShellGuardAllowsNonMutatingGhIssueList() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            XCTFail("Bruno should not run for non-mutating gh reads")
+            return BrunoGuardDecision(decision: "deny")
+        })
 
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksPathToWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "/opt/homebrew/bin/gh auth status")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksEnvironmentPrefixedWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "env GH_HOST=github.com gh issue list")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksAssignmentPrefixedWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "FOO=1 gh api /user")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksEnvOptionPrefixedWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "env -i GH_HOST=github.com gh issue list")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksCompoundWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "git status && gh issue list")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardBlocksAegisRunWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "aegis-secret run gh -- issue list")
-
-        XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("wrapped command `gh`"))
-    }
-
-    func testShellGuardAllowsUnrelatedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "git status --short")
+        let result = await guarder.evaluate(command: "gh issue list")
 
         XCTAssertTrue(result.allowed)
     }
 
-    func testShellGuardAllowsQuotedMentionOfWrappedCommand() {
-        let result = ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "printf 'gh issue list'")
+    func testShellGuardBlocksBrokerRequiredWrappedCommand() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "/opt/homebrew/bin/gh auth status")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("privileged command `gh`"))
+    }
+
+    func testShellGuardAllowsEnvironmentPrefixedGhRead() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "env GH_HOST=github.com gh issue list")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardAllowsAssignmentPrefixedGhRead() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "FOO=1 gh api /user")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardAllowsCompoundGhRead() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "git status && gh issue list")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardAllowsAegisRunGhRead() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "aegis-secret run gh -- issue list")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardDeniesProtectedGhMutationWhenBrunoDenies() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { event in
+            guard case .object(let root) = event,
+                  case .object(let action)? = root["action"],
+                  action["kind"] == .string("github.issue.close") else {
+                XCTFail("expected protected issue close event")
+                return BrunoGuardDecision(decision: "deny")
+            }
+            return BrunoGuardDecision(
+                decision: "deny",
+                recommendedNextPrompt: "Stop and add closure evidence."
+            )
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Stop and add closure evidence."))
+    }
+
+    func testShellGuardAllowsProtectedGhMutationWhenBrunoAllows() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { event in
+            guard case .object(let root) = event,
+                  case .array(let evidenceRefs)? = root["evidence_refs"],
+                  case .object(let action)? = root["action"],
+                  case .array(let argv)? = action["argv"] else {
+                XCTFail("expected Bruno event with action argv and evidence refs")
+                return BrunoGuardDecision(decision: "deny")
+            }
+            XCTAssertFalse(evidenceRefs.isEmpty)
+            XCTAssertTrue(argv.contains(.string("[REDACTED]")))
+            return BrunoGuardDecision(decision: "allow")
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret --comment 'Evidence artifact://local/smoke'")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardFailsClosedWhenBrunoTimesOut() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh")
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            throw AegisSecretError.runtime("Bruno guard timed out after 5 seconds.")
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("failed closed"))
+        XCTAssertTrue(result.message.contains("timed out"))
+    }
+
+    func testShellGuardFailsClosedWhenBrunoOutputIsMalformed() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh")
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            throw AegisSecretError.runtime("Bruno guard returned malformed output.")
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("malformed output"))
+    }
+
+    func testShellGuardBlocksTerraformApplyThroughBrokerMCP() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "terraform", denyPrefixes: [["apply"]])
+        ]).evaluate(command: "terraform apply")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Aegis Broker MCP"))
+    }
+
+    func testShellGuardAllowsUnrelatedCommand() async {
+        let result = await ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "git status --short")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardAllowsQuotedMentionOfWrappedCommand() async {
+        let result = await ShellBypassGuard(wrappedCommandNames: ["gh"]).evaluate(command: "printf 'gh issue list'")
 
         XCTAssertTrue(result.allowed)
     }

@@ -1527,14 +1527,144 @@ public struct ShellGuardResult: Equatable, Sendable {
     }
 }
 
-public struct ShellBypassGuard: Sendable {
-    public let wrappedCommandNames: Set<String>
+public struct ShellGuardWrappedCommand: Equatable, Sendable {
+    public let name: String
+    public let denyPrefixes: [[String]]
 
-    public init(wrappedCommandNames: Set<String>) {
-        self.wrappedCommandNames = wrappedCommandNames
+    public init(name: String, denyPrefixes: [[String]] = []) {
+        self.name = name
+        self.denyPrefixes = denyPrefixes
+    }
+}
+
+public struct BrunoGuardReason: Decodable, Equatable, Sendable {
+    public let code: String
+    public let severity: String
+    public let message: String
+}
+
+public struct BrunoGuardDecision: Decodable, Equatable, Sendable {
+    public let decision: String
+    public let reasons: [BrunoGuardReason]
+    public let requiredEvidence: [String]
+    public let recommendedNextPrompt: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case decision
+        case reasons
+        case requiredEvidence = "required_evidence"
+        case recommendedNextPrompt = "recommended_next_prompt"
     }
 
-    public func evaluate(command: String) -> ShellGuardResult {
+    public init(
+        decision: String,
+        reasons: [BrunoGuardReason] = [],
+        requiredEvidence: [String] = [],
+        recommendedNextPrompt: String? = nil
+    ) {
+        self.decision = decision
+        self.reasons = reasons
+        self.requiredEvidence = requiredEvidence
+        self.recommendedNextPrompt = recommendedNextPrompt
+    }
+}
+
+public protocol BrunoGuardEvaluating: Sendable {
+    func evaluate(event: JSONValue) async throws -> BrunoGuardDecision
+}
+
+public struct ProcessBrunoGuardEvaluator: BrunoGuardEvaluating {
+    public let commandStore: CommandStore
+    public let executor: CommandExecutor
+    public let environment: [String: String]
+    public let timeoutSeconds: Int
+    public let maxOutputBytes: Int
+
+    public init(
+        commandStore: CommandStore = CommandStore(),
+        executor: CommandExecutor = ProcessCommandExecutor(),
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        timeoutSeconds: Int = 5,
+        maxOutputBytes: Int = 64 * 1024
+    ) {
+        self.commandStore = commandStore
+        self.executor = executor
+        self.environment = environment
+        self.timeoutSeconds = timeoutSeconds
+        self.maxOutputBytes = maxOutputBytes
+    }
+
+    public func evaluate(event: JSONValue) async throws -> BrunoGuardDecision {
+        guard let brunoURL = commandStore.resolveExecutable(named: "bruno") else {
+            throw AegisSecretError.runtime("Bruno guard binary `bruno` was not found on PATH.")
+        }
+
+        let fileManager = FileManager.default
+        let eventURL = fileManager.temporaryDirectory
+            .appendingPathComponent("aegis-broker-bruno-\(UUID().uuidString).json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(event).write(to: eventURL, options: .atomic)
+        defer { try? fileManager.removeItem(at: eventURL) }
+
+        let result = try await executor.execute(
+            CommandExecutionRequest(
+                executableURL: brunoURL,
+                arguments: ["guard", "--file", eventURL.path, "--json"],
+                environment: environment,
+                currentDirectoryURL: nil,
+                timeoutSeconds: timeoutSeconds,
+                maxOutputBytes: maxOutputBytes
+            )
+        )
+
+        guard let decision = try? JSONDecoder().decode(BrunoGuardDecision.self, from: result.stdout) else {
+            throw AegisSecretError.runtime("Bruno guard returned malformed output.")
+        }
+
+        if result.exitCode != 0 && result.exitCode != 1 {
+            throw AegisSecretError.runtime("Bruno guard failed with exit code \(result.exitCode).")
+        }
+
+        return decision
+    }
+}
+
+public struct ShellBypassGuard: Sendable {
+    public let wrappedCommands: [String: ShellGuardWrappedCommand]
+    public let brunoEvaluator: (any BrunoGuardEvaluating)?
+
+    public init(
+        wrappedCommands: [ShellGuardWrappedCommand],
+        brunoEvaluator: (any BrunoGuardEvaluating)? = ProcessBrunoGuardEvaluator()
+    ) {
+        self.wrappedCommands = Dictionary(uniqueKeysWithValues: wrappedCommands.map { ($0.name, $0) })
+        self.brunoEvaluator = brunoEvaluator
+    }
+
+    public init(
+        resolvedCommands: [ResolvedWrappedCommand],
+        brunoEvaluator: (any BrunoGuardEvaluating)? = ProcessBrunoGuardEvaluator()
+    ) {
+        self.init(
+            wrappedCommands: resolvedCommands.map {
+                ShellGuardWrappedCommand(name: $0.name, denyPrefixes: $0.denyPrefixes)
+            },
+            brunoEvaluator: brunoEvaluator
+        )
+    }
+
+    public init(
+        wrappedCommandNames: Set<String>,
+        brunoEvaluator: (any BrunoGuardEvaluating)? = nil
+    ) {
+        self.init(
+            wrappedCommands: wrappedCommandNames.map { ShellGuardWrappedCommand(name: $0) },
+            brunoEvaluator: brunoEvaluator
+        )
+    }
+
+    public func evaluate(command: String) async -> ShellGuardResult {
         for segment in shellSegments(command) {
             let tokens = shellTokens(segment)
             guard let executableIndex = executableTokenIndex(in: tokens) else {
@@ -1542,26 +1672,276 @@ public struct ShellBypassGuard: Sendable {
             }
 
             let executableName = lastPathComponent(tokens[executableIndex])
-            if wrappedCommandNames.contains(executableName) {
-                return blocked(commandName: executableName)
+            let args = Array(tokens.dropFirst(executableIndex + 1))
+            if executableName == "gh", let protected = protectedGitHubMutation(args: args) {
+                return await evaluateProtectedGitHubMutation(protected, commandName: executableName, args: args)
+            }
+
+            if brokerRequired(commandName: executableName, args: args) {
+                return brokerRequiredBlocked(commandName: executableName)
             }
 
             if executableName == "aegis-secret",
                tokens.count > executableIndex + 2,
                tokens[executableIndex + 1] == "run",
-               wrappedCommandNames.contains(tokens[executableIndex + 2]) {
-                return blocked(commandName: tokens[executableIndex + 2])
+               wrappedCommands[tokens[executableIndex + 2]] != nil {
+                let commandName = tokens[executableIndex + 2]
+                let passthroughArgs = passthroughRunArguments(tokens: tokens, start: executableIndex + 3)
+                if commandName == "gh", let protected = protectedGitHubMutation(args: passthroughArgs) {
+                    return await evaluateProtectedGitHubMutation(protected, commandName: commandName, args: passthroughArgs)
+                }
+                if brokerRequired(commandName: commandName, args: passthroughArgs) {
+                    return brokerRequiredBlocked(commandName: commandName)
+                }
             }
         }
 
         return ShellGuardResult(allowed: true)
     }
 
-    private func blocked(commandName: String) -> ShellGuardResult {
+    private func evaluateProtectedGitHubMutation(
+        _ mutation: ProtectedGitHubMutation,
+        commandName: String,
+        args: [String]
+    ) async -> ShellGuardResult {
+        guard let brunoEvaluator else {
+            return ShellGuardResult(allowed: true)
+        }
+
+        do {
+            let decision = try await brunoEvaluator.evaluate(event: brunoEvent(for: mutation, commandName: commandName, args: args))
+            if decision.decision != "allow" {
+                return ShellGuardResult(
+                    allowed: false,
+                    message: "Blocked protected GitHub mutation `\(commandName) \(redactedArguments(args).joined(separator: " "))`: \(brunoMessage(from: decision))"
+                )
+            }
+            return ShellGuardResult(allowed: true)
+        } catch {
+            return ShellGuardResult(
+                allowed: false,
+                message: "Blocked protected GitHub mutation `\(commandName) \(redactedArguments(args).joined(separator: " "))`: Bruno guard failed closed: \(errorDescription(error))"
+            )
+        }
+    }
+
+    private func brunoMessage(from decision: BrunoGuardDecision) -> String {
+        if let prompt = decision.recommendedNextPrompt?.trimmedNonEmpty {
+            return prompt
+        }
+        if let reason = decision.reasons.first?.message.trimmedNonEmpty {
+            return reason
+        }
+        if let evidence = decision.requiredEvidence.first {
+            return "Required evidence: \(evidence)."
+        }
+        return "Bruno denied the protected mutation."
+    }
+
+    private func errorDescription(_ error: Error) -> String {
+        if let aegisError = error as? AegisSecretError {
+            return aegisError.description
+        }
+        return error.localizedDescription
+    }
+
+    private func brokerRequired(commandName: String, args: [String]) -> Bool {
+        guard let command = wrappedCommands[commandName] else {
+            return false
+        }
+        return command.denyPrefixes.contains { matchesPrefix(args, prefix: $0) }
+    }
+
+    private func brokerRequiredBlocked(commandName: String) -> ShellGuardResult {
         ShellGuardResult(
             allowed: false,
-            message: "Blocked direct shell use of wrapped command `\(commandName)`. Use the Aegis MCP `list_commands` tool, then `run_command` for `\(commandName)`."
+            message: "Blocked direct shell use of privileged command `\(commandName)`. Use the Aegis Broker MCP `list_commands` tool, then `run_command` for `\(commandName)`."
         )
+    }
+
+    private func passthroughRunArguments(tokens: [String], start: Int) -> [String] {
+        var args = Array(tokens.dropFirst(start))
+        if args.first == "--" {
+            args.removeFirst()
+        }
+        return args
+    }
+
+    private struct ProtectedGitHubMutation {
+        let kind: String
+        let target: String?
+        let repo: String?
+        let evidenceRefs: [JSONValue]
+    }
+
+    private func protectedGitHubMutation(args: [String]) -> ProtectedGitHubMutation? {
+        guard args.count >= 2 else {
+            return nil
+        }
+
+        let normalizedArgs = args.first == "gh" ? Array(args.dropFirst()) : args
+        guard normalizedArgs.count >= 2 else {
+            return nil
+        }
+
+        let scope = normalizedArgs[0]
+        let action = normalizedArgs[1]
+        guard let kind = protectedGitHubKind(scope: scope, action: action) else {
+            return nil
+        }
+
+        return ProtectedGitHubMutation(
+            kind: kind,
+            target: firstPositionalTarget(in: Array(normalizedArgs.dropFirst(2))),
+            repo: optionValue(in: normalizedArgs, names: ["--repo", "-R"]),
+            evidenceRefs: evidenceRefs(in: normalizedArgs)
+        )
+    }
+
+    private func protectedGitHubKind(scope: String, action: String) -> String? {
+        switch (scope, action) {
+        case ("issue", "close"), ("issue", "edit"), ("issue", "reopen"), ("issue", "lock"), ("issue", "unlock"), ("issue", "transfer"):
+            return "github.issue.\(action)"
+        case ("pr", "merge"), ("pr", "close"), ("pr", "edit"), ("pr", "ready"), ("pr", "lock"), ("pr", "unlock"):
+            return "github.pr.\(action)"
+        case ("release", "create"), ("release", "edit"), ("release", "delete"):
+            return "github.release.\(action)"
+        default:
+            return nil
+        }
+    }
+
+    private func brunoEvent(for mutation: ProtectedGitHubMutation, commandName: String, args: [String]) -> JSONValue {
+        var subjectRefs: [String: JSONValue] = [:]
+        if let repo = mutation.repo?.trimmedNonEmpty {
+            subjectRefs["repo"] = .string("github://\(repo)")
+            if let target = mutation.target?.trimmedNonEmpty {
+                if mutation.kind.hasPrefix("github.issue.") {
+                    subjectRefs["issue"] = .string("github://\(repo)/issues/\(target)")
+                } else if mutation.kind.hasPrefix("github.pr.") {
+                    subjectRefs["pr"] = .string("github://\(repo)/pull/\(target)")
+                } else if mutation.kind.hasPrefix("github.release.") {
+                    subjectRefs["release"] = .string("github://\(repo)/releases/tag/\(target)")
+                }
+            }
+        }
+
+        return .object([
+            "schema_version": .string("aegis.broker.bruno_event.v1"),
+            "action": .object([
+                "kind": .string(mutation.kind),
+                "command": .string(commandName),
+                "argv": .array(redactedArguments(args).map { .string($0) }),
+            ]),
+            "subject_refs": .object(subjectRefs),
+            "actor": .object([
+                "agent": .string("local-agent"),
+                "session_ref": .string("agent-session://local"),
+            ]),
+            "context": .object([
+                "tool_kind": .string("shell"),
+                "cwd": .string("[REDACTED_PATH]"),
+            ]),
+            "redaction_state": .string("metadata_only"),
+            "evidence_refs": .array(mutation.evidenceRefs),
+        ])
+    }
+
+    private func redactedArguments(_ args: [String]) -> [String] {
+        var redacted: [String] = []
+        var redactNext = false
+        for arg in args {
+            if redactNext {
+                redacted.append("[REDACTED]")
+                redactNext = false
+                continue
+            }
+            redacted.append(arg)
+            if ["--comment", "--body", "--notes", "--message", "-m"].contains(arg) {
+                redactNext = true
+            } else if ["--comment=", "--body=", "--notes=", "--message="].contains(where: { arg.hasPrefix($0) }) {
+                let prefix = arg.prefix { $0 != "=" }
+                redacted[redacted.count - 1] = "\(prefix)=[REDACTED]"
+            }
+        }
+        return redacted
+    }
+
+    private func firstPositionalTarget(in args: [String]) -> String? {
+        var skipNext = false
+        for arg in args {
+            if skipNext {
+                skipNext = false
+                continue
+            }
+            if arg.hasPrefix("--") {
+                if !arg.contains("=") {
+                    skipNext = true
+                }
+                continue
+            }
+            if arg.hasPrefix("-") {
+                skipNext = true
+                continue
+            }
+            return arg
+        }
+        return nil
+    }
+
+    private func optionValue(in args: [String], names: Set<String>) -> String? {
+        for (index, arg) in args.enumerated() {
+            for name in names {
+                if arg == name, args.indices.contains(index + 1) {
+                    return args[index + 1]
+                }
+                if arg.hasPrefix("\(name)=") {
+                    return String(arg.dropFirst(name.count + 1))
+                }
+            }
+        }
+        return nil
+    }
+
+    private func evidenceRefs(in args: [String]) -> [JSONValue] {
+        var refs: [JSONValue] = []
+        for value in messageValues(in: args) {
+            refs.append(contentsOf: artifactRefs(in: value).map { ref in
+                .object([
+                    "ref": .string(ref),
+                    "kind": .string("local_evidence"),
+                    "redaction_state": .string("metadata_only"),
+                ])
+            })
+        }
+        return refs
+    }
+
+    private func messageValues(in args: [String]) -> [String] {
+        var values: [String] = []
+        var captureNext = false
+        for arg in args {
+            if captureNext {
+                values.append(arg)
+                captureNext = false
+                continue
+            }
+            if ["--comment", "--body", "--notes", "--message", "-m"].contains(arg) {
+                captureNext = true
+                continue
+            }
+            for prefix in ["--comment=", "--body=", "--notes=", "--message="] where arg.hasPrefix(prefix) {
+                values.append(String(arg.dropFirst(prefix.count)))
+            }
+        }
+        return values
+    }
+
+    private func artifactRefs(in value: String) -> [String] {
+        value
+            .split(whereSeparator: { $0.isWhitespace || $0 == "," || $0 == ")" || $0 == "]" })
+            .map(String.init)
+            .filter { $0.hasPrefix("artifact://") || $0.hasPrefix("evidence://") }
     }
 
     private func executableTokenIndex(in tokens: [String]) -> Int? {
@@ -2081,7 +2461,7 @@ public struct CLIApplication {
         case .approval(let approvalCommand):
             try handleApprovalManagement(approvalCommand)
         case .guardCommand(let guardCommand):
-            try handleGuard(guardCommand)
+            try await handleGuard(guardCommand)
         case .run(let name, let args):
             let result = try await wrappedCommandRunner.run(
                 name: name,
@@ -2138,11 +2518,11 @@ public struct CLIApplication {
         }
     }
 
-    private func handleGuard(_ command: GuardCommand) throws {
+    private func handleGuard(_ command: GuardCommand) async throws {
         switch command {
         case .shell(let explicitCommand):
             let commandText = try explicitCommand ?? extractShellCommand(from: FileHandle.standardInput.readDataToEndOfFile())
-            let guardResult = try ShellBypassGuard(wrappedCommandNames: Set(commandStore.resolvedCommands().map(\.name)))
+            let guardResult = await ShellBypassGuard(resolvedCommands: try commandStore.resolvedCommands())
                 .evaluate(command: commandText)
             if guardResult.allowed {
                 return
@@ -2248,7 +2628,7 @@ public struct UserInstallationSummary {
 }
 
 public struct AgentHookConfigUpdater {
-    public static let managedStatusMessage = "Aegis Secret: checking wrapped CLI route"
+    public static let managedStatusMessage = "Aegis Broker: checking protected tool route"
 
     public init() {}
 
