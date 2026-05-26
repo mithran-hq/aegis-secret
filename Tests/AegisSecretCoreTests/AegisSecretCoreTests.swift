@@ -138,6 +138,39 @@ final class AegisSecretCoreTests: XCTestCase {
         )
     }
 
+    func testRecoveryDiagnoseParsesSourceApp() throws {
+        XCTAssertEqual(
+            try CommandParser().parse([
+                "recovery", "diagnose",
+                "--source-app", "/tmp/Aegis Secret.app/Contents/MacOS/aegis-secret"
+            ], stdinIsTTY: true),
+            .recovery(.diagnose(sourceApp: "/tmp/Aegis Secret.app/Contents/MacOS/aegis-secret"))
+        )
+    }
+
+    func testRecoveryMigrateParsesAllAndOverwrite() throws {
+        XCTAssertEqual(
+            try CommandParser().parse([
+                "recovery", "migrate",
+                "--source-app", "/tmp/aegis-secret",
+                "--all",
+                "--overwrite"
+            ], stdinIsTTY: true),
+            .recovery(.migrate(sourceApp: "/tmp/aegis-secret", selection: .allMissing, overwrite: true))
+        )
+    }
+
+    func testRecoveryMigrateParsesSingleKey() throws {
+        XCTAssertEqual(
+            try CommandParser().parse([
+                "recovery", "migrate",
+                "--source-app", "/tmp/aegis-secret",
+                "--key", "OPENAI_API_KEY"
+            ], stdinIsTTY: true),
+            .recovery(.migrate(sourceApp: "/tmp/aegis-secret", selection: .key("OPENAI_API_KEY"), overwrite: false))
+        )
+    }
+
     func testRunParsesArgsAfterDoubleDash() throws {
         XCTAssertEqual(
             try CommandParser().parse(["run", "gh", "--", "api", "/user"], stdinIsTTY: true),
@@ -1135,6 +1168,73 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertEqual(once, twice)
         XCTAssertTrue(once.contains("[features]\nhooks = true\nplugins = true"))
         XCTAssertTrue(once.contains("[tui]\ntheme = \"dark\""))
+    }
+
+    func testRecoveryPlannerMigratesOnlyMissingByDefault() throws {
+        let plan = try KeychainRecoveryPlanner().plan(
+            sourceKeys: ["GITHUB_TOKEN", "OPENAI_API_KEY", "VOYAGE_API_KEY"],
+            targetKeys: ["GITHUB_TOKEN"],
+            selection: .allMissing,
+            overwrite: false
+        )
+
+        XCTAssertEqual(plan.keysToMigrate, ["OPENAI_API_KEY", "VOYAGE_API_KEY"])
+        XCTAssertEqual(plan.skippedAlreadyPresent, ["GITHUB_TOKEN"])
+    }
+
+    func testRecoveryPlannerOverwriteMigratesAllSourceKeys() throws {
+        let plan = try KeychainRecoveryPlanner().plan(
+            sourceKeys: ["GITHUB_TOKEN", "OPENAI_API_KEY"],
+            targetKeys: ["GITHUB_TOKEN"],
+            selection: .allMissing,
+            overwrite: true
+        )
+
+        XCTAssertEqual(plan.keysToMigrate, ["GITHUB_TOKEN", "OPENAI_API_KEY"])
+        XCTAssertEqual(plan.skippedAlreadyPresent, [])
+    }
+
+    func testRecoveryPlannerSkipsExistingSelectedKeyUnlessOverwrite() throws {
+        let plan = try KeychainRecoveryPlanner().plan(
+            sourceKeys: ["OPENAI_API_KEY"],
+            targetKeys: ["OPENAI_API_KEY"],
+            selection: .key("OPENAI_API_KEY"),
+            overwrite: false
+        )
+
+        XCTAssertEqual(plan.keysToMigrate, [])
+        XCTAssertEqual(plan.skippedAlreadyPresent, ["OPENAI_API_KEY"])
+    }
+
+    func testRecoveryRendererDoesNotIncludeSecretValues() {
+        let source = KeychainRecoveryAppSnapshot(
+            identity: SignedAegisAppIdentity(
+                executablePath: "/old/aegis-secret",
+                teamIdentifier: "TEAM123456",
+                applicationIdentifier: "OLDPREFIX.com.olympum.aegis-secret",
+                keychainAccessGroups: ["OLDPREFIX.com.olympum.aegis-secret"]
+            ),
+            keys: ["GITHUB_TOKEN", "OPENAI_API_KEY"]
+        )
+        let target = KeychainRecoveryAppSnapshot(
+            identity: SignedAegisAppIdentity(
+                executablePath: "/new/aegis-secret",
+                teamIdentifier: "TEAM123456",
+                applicationIdentifier: "TEAM123456.com.olympum.aegis-secret",
+                keychainAccessGroups: ["TEAM123456.com.olympum.aegis-secret"]
+            ),
+            keys: ["GITHUB_TOKEN"]
+        )
+
+        let rendered = KeychainRecoveryRenderer().render(
+            diagnosis: KeychainRecoveryDiagnosis(source: source, target: target)
+        )
+
+        XCTAssertTrue(rendered.contains("Missing from target: 1"))
+        XCTAssertTrue(rendered.contains("OPENAI_API_KEY"))
+        XCTAssertTrue(rendered.contains("No secret values were read"))
+        XCTAssertFalse(rendered.contains("sk-proj"))
+        XCTAssertFalse(rendered.contains("ghp_"))
     }
 
     func testUserInstallerOverwritesExistingLocalBinaryWithShim() throws {

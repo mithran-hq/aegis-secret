@@ -2621,6 +2621,16 @@ public enum GuardCommand: Equatable {
     case shell(command: String?)
 }
 
+public enum KeychainRecoveryCommand: Equatable {
+    case diagnose(sourceApp: String)
+    case migrate(sourceApp: String, selection: KeychainRecoverySelection, overwrite: Bool)
+}
+
+public enum KeychainRecoverySelection: Equatable {
+    case allMissing
+    case key(String)
+}
+
 public enum CLICommand: Equatable {
     case set(key: String, inputMode: SecretInputMode)
     case get(key: String, agentName: String)
@@ -2630,6 +2640,7 @@ public enum CLICommand: Equatable {
     case command(WrappedCommandManagementCommand)
     case approval(ApprovalManagementCommand)
     case guardCommand(GuardCommand)
+    case recovery(KeychainRecoveryCommand)
     case run(name: String, args: [String])
     case help
 }
@@ -2665,6 +2676,8 @@ public struct CommandParser {
             return try parseApproval(Array(arguments.dropFirst()))
         case "guard":
             return try parseGuard(Array(arguments.dropFirst()))
+        case "recovery":
+            return try parseRecovery(Array(arguments.dropFirst()))
         case "run":
             return try parseRun(Array(arguments.dropFirst()))
         case "help", "--help", "-h":
@@ -2815,6 +2828,75 @@ public struct CommandParser {
         return .guardCommand(.shell(command: remaining[1]))
     }
 
+    private func parseRecovery(_ arguments: [String]) throws -> CLICommand {
+        guard let subcommand = arguments.first else {
+            throw AegisSecretError.usage("`recovery` requires a subcommand.")
+        }
+
+        var sourceApp: String?
+        var selection: KeychainRecoverySelection?
+        var overwrite = false
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--source-app":
+                let nextIndex = index + 1
+                guard nextIndex < arguments.count else {
+                    throw AegisSecretError.usage("`recovery \(subcommand) --source-app` requires a path.")
+                }
+                sourceApp = arguments[nextIndex]
+                index += 2
+            case "--all":
+                guard subcommand == "migrate" else {
+                    throw AegisSecretError.usage("`recovery diagnose` does not accept `--all`.")
+                }
+                guard selection == nil else {
+                    throw AegisSecretError.usage("Choose either `--all` or `--key`, not both.")
+                }
+                selection = .allMissing
+                index += 1
+            case "--key":
+                guard subcommand == "migrate" else {
+                    throw AegisSecretError.usage("`recovery diagnose` does not accept `--key`.")
+                }
+                let nextIndex = index + 1
+                guard nextIndex < arguments.count else {
+                    throw AegisSecretError.usage("`recovery migrate --key` requires a key name.")
+                }
+                guard selection == nil else {
+                    throw AegisSecretError.usage("Choose either `--all` or `--key`, not both.")
+                }
+                selection = .key(arguments[nextIndex])
+                index += 2
+            case "--overwrite":
+                guard subcommand == "migrate" else {
+                    throw AegisSecretError.usage("`recovery diagnose` does not accept `--overwrite`.")
+                }
+                overwrite = true
+                index += 1
+            default:
+                throw AegisSecretError.usage("Unknown argument for `recovery \(subcommand)`: `\(argument)`.")
+            }
+        }
+
+        guard let sourceApp, !sourceApp.isEmpty else {
+            throw AegisSecretError.usage("`recovery \(subcommand)` requires `--source-app <path-to-aegis-secret-binary>`.")
+        }
+
+        switch subcommand {
+        case "diagnose":
+            return .recovery(.diagnose(sourceApp: sourceApp))
+        case "migrate":
+            guard let selection else {
+                throw AegisSecretError.usage("`recovery migrate` requires `--all` or `--key <name>`.")
+            }
+            return .recovery(.migrate(sourceApp: sourceApp, selection: selection, overwrite: overwrite))
+        default:
+            throw AegisSecretError.usage("Unknown recovery subcommand `\(subcommand)`.")
+        }
+    }
+
     private func parseRun(_ arguments: [String]) throws -> CLICommand {
         guard let name = arguments.first, !name.hasPrefix("-") else {
             throw AegisSecretError.usage("`run` requires a wrapped command name.")
@@ -2829,24 +2911,415 @@ public struct CommandParser {
     }
 }
 
+public struct SignedAegisAppIdentity: Equatable, Sendable {
+    public let executablePath: String
+    public let teamIdentifier: String
+    public let applicationIdentifier: String
+    public let keychainAccessGroups: [String]
+
+    public init(
+        executablePath: String,
+        teamIdentifier: String,
+        applicationIdentifier: String,
+        keychainAccessGroups: [String]
+    ) {
+        self.executablePath = executablePath
+        self.teamIdentifier = teamIdentifier
+        self.applicationIdentifier = applicationIdentifier
+        self.keychainAccessGroups = keychainAccessGroups
+    }
+
+    public var primaryKeychainAccessGroup: String {
+        keychainAccessGroups.first ?? ""
+    }
+}
+
+public struct KeychainRecoveryAppSnapshot: Equatable, Sendable {
+    public let identity: SignedAegisAppIdentity
+    public let keys: [String]
+
+    public init(identity: SignedAegisAppIdentity, keys: [String]) {
+        self.identity = identity
+        self.keys = keys
+    }
+}
+
+public struct KeychainRecoveryDiagnosis: Equatable, Sendable {
+    public let source: KeychainRecoveryAppSnapshot
+    public let target: KeychainRecoveryAppSnapshot
+    public let missingFromTarget: [String]
+    public let alreadyPresent: [String]
+
+    public init(source: KeychainRecoveryAppSnapshot, target: KeychainRecoveryAppSnapshot) {
+        self.source = source
+        self.target = target
+        let sourceKeys = Set(source.keys)
+        let targetKeys = Set(target.keys)
+        self.missingFromTarget = sourceKeys.subtracting(targetKeys).sorted()
+        self.alreadyPresent = sourceKeys.intersection(targetKeys).sorted()
+    }
+}
+
+public struct KeychainRecoveryMigrationPlan: Equatable, Sendable {
+    public let keysToMigrate: [String]
+    public let skippedAlreadyPresent: [String]
+
+    public init(keysToMigrate: [String], skippedAlreadyPresent: [String]) {
+        self.keysToMigrate = keysToMigrate
+        self.skippedAlreadyPresent = skippedAlreadyPresent
+    }
+}
+
+public struct KeychainRecoveryMigrationResult: Equatable, Sendable {
+    public let source: SignedAegisAppIdentity
+    public let target: SignedAegisAppIdentity
+    public let migratedKeys: [String]
+    public let skippedAlreadyPresent: [String]
+
+    public init(
+        source: SignedAegisAppIdentity,
+        target: SignedAegisAppIdentity,
+        migratedKeys: [String],
+        skippedAlreadyPresent: [String]
+    ) {
+        self.source = source
+        self.target = target
+        self.migratedKeys = migratedKeys
+        self.skippedAlreadyPresent = skippedAlreadyPresent
+    }
+}
+
+public struct KeychainRecoveryPlanner {
+    public init() {}
+
+    public func plan(
+        sourceKeys: [String],
+        targetKeys: [String],
+        selection: KeychainRecoverySelection,
+        overwrite: Bool
+    ) throws -> KeychainRecoveryMigrationPlan {
+        let sourceSet = Set(sourceKeys)
+        let targetSet = Set(targetKeys)
+
+        switch selection {
+        case .allMissing:
+            if overwrite {
+                return KeychainRecoveryMigrationPlan(keysToMigrate: sourceSet.sorted(), skippedAlreadyPresent: [])
+            }
+            return KeychainRecoveryMigrationPlan(
+                keysToMigrate: sourceSet.subtracting(targetSet).sorted(),
+                skippedAlreadyPresent: sourceSet.intersection(targetSet).sorted()
+            )
+        case .key(let key):
+            guard sourceSet.contains(key) else {
+                throw AegisSecretError.runtime("Source app cannot see secret `\(key)`.")
+            }
+            if targetSet.contains(key) && !overwrite {
+                return KeychainRecoveryMigrationPlan(keysToMigrate: [], skippedAlreadyPresent: [key])
+            }
+            return KeychainRecoveryMigrationPlan(keysToMigrate: [key], skippedAlreadyPresent: [])
+        }
+    }
+}
+
+public protocol SignedAegisAppInspecting: Sendable {
+    func inspect(executablePath: String) throws -> SignedAegisAppIdentity
+}
+
+public protocol KeychainRecoverySourceClient: Sendable {
+    func listKeys(sourceExecutablePath: String) throws -> [String]
+    func readSecret(sourceExecutablePath: String, key: String, agent: String) throws -> Data
+}
+
+public struct CodesignAegisAppInspector: SignedAegisAppInspecting {
+    public init() {}
+
+    public func inspect(executablePath: String) throws -> SignedAegisAppIdentity {
+        let resolvedPath = URL(fileURLWithPath: expandUserPath(executablePath)).resolvingSymlinksInPath().path
+        guard FileManager.default.isExecutableFile(atPath: resolvedPath) else {
+            throw AegisSecretError.runtime("Aegis app binary is not executable at `\(resolvedPath)`.")
+        }
+
+        let result = try runCodesign(arguments: ["-d", "--entitlements", ":-", resolvedPath])
+        guard result.exitCode == 0 else {
+            throw AegisSecretError.runtime("Unable to inspect code signature for `\(resolvedPath)`.")
+        }
+        guard !result.stdout.isEmpty else {
+            throw AegisSecretError.runtime("Code signature for `\(resolvedPath)` did not include entitlements.")
+        }
+        guard let plist = try PropertyListSerialization.propertyList(
+            from: result.stdout,
+            options: [],
+            format: nil
+        ) as? [String: Any] else {
+            throw AegisSecretError.runtime("Code signature entitlements for `\(resolvedPath)` were not a plist dictionary.")
+        }
+
+        guard let teamIdentifier = (plist["com.apple.developer.team-identifier"] as? String)?.trimmedNonEmpty else {
+            throw AegisSecretError.runtime("Code signature for `\(resolvedPath)` does not prove an Apple team identifier.")
+        }
+        guard let applicationIdentifier = (plist["com.apple.application-identifier"] as? String)?.trimmedNonEmpty else {
+            throw AegisSecretError.runtime("Code signature for `\(resolvedPath)` does not prove an application identifier.")
+        }
+        guard let keychainAccessGroups = plist["keychain-access-groups"] as? [String],
+              !keychainAccessGroups.isEmpty else {
+            throw AegisSecretError.runtime("Code signature for `\(resolvedPath)` does not prove a keychain access group.")
+        }
+
+        let identity = SignedAegisAppIdentity(
+            executablePath: resolvedPath,
+            teamIdentifier: teamIdentifier,
+            applicationIdentifier: applicationIdentifier,
+            keychainAccessGroups: keychainAccessGroups
+        )
+        try validateAegisIdentity(identity)
+        return identity
+    }
+
+    private func validateAegisIdentity(_ identity: SignedAegisAppIdentity) throws {
+        let expectedBundleIdentifier = "com.olympum.aegis-secret"
+        guard identity.applicationIdentifier.hasSuffix(".\(expectedBundleIdentifier)") else {
+            throw AegisSecretError.runtime("Signed app `\(identity.executablePath)` is not an Aegis Secret app identifier.")
+        }
+        guard identity.keychainAccessGroups.contains(where: { $0.hasSuffix(".\(expectedBundleIdentifier)") }) else {
+            throw AegisSecretError.runtime("Signed app `\(identity.executablePath)` is not entitled for the Aegis Secret keychain group.")
+        }
+    }
+
+    private func runCodesign(arguments: [String]) throws -> RecoveryProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = arguments
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        return RecoveryProcessResult(
+            stdout: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
+            stderr: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            exitCode: process.terminationStatus
+        )
+    }
+}
+
+public struct ProcessKeychainRecoverySourceClient: KeychainRecoverySourceClient {
+    public init() {}
+
+    public func listKeys(sourceExecutablePath: String) throws -> [String] {
+        let result = try runSource(executablePath: sourceExecutablePath, arguments: ["list"])
+        guard result.exitCode == 0 else {
+            throw AegisSecretError.runtime("Source app failed to list key names.")
+        }
+        let output = String(decoding: result.stdout, as: UTF8.self)
+        return output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
+    public func readSecret(sourceExecutablePath: String, key: String, agent: String) throws -> Data {
+        let result = try runSource(
+            executablePath: sourceExecutablePath,
+            arguments: ["get", key, "--agent", agent]
+        )
+        guard result.exitCode == 0 else {
+            throw AegisSecretError.runtime("Source app failed to read secret `\(key)` for migration.")
+        }
+        guard !result.stdout.isEmpty else {
+            throw AegisSecretError.runtime("Source app returned an empty secret for `\(key)`; refusing to migrate it.")
+        }
+        return result.stdout
+    }
+
+    private func runSource(executablePath: String, arguments: [String]) throws -> RecoveryProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        return RecoveryProcessResult(
+            stdout: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
+            stderr: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            exitCode: process.terminationStatus
+        )
+    }
+}
+
+public struct KeychainRecoveryTool {
+    public let targetExecutablePath: String
+    public let secretStore: SecretStore
+    public let inspector: SignedAegisAppInspecting
+    public let sourceClient: KeychainRecoverySourceClient
+    public let planner: KeychainRecoveryPlanner
+
+    public init(
+        targetExecutablePath: String,
+        secretStore: SecretStore,
+        inspector: SignedAegisAppInspecting = CodesignAegisAppInspector(),
+        sourceClient: KeychainRecoverySourceClient = ProcessKeychainRecoverySourceClient(),
+        planner: KeychainRecoveryPlanner = KeychainRecoveryPlanner()
+    ) {
+        self.targetExecutablePath = targetExecutablePath
+        self.secretStore = secretStore
+        self.inspector = inspector
+        self.sourceClient = sourceClient
+        self.planner = planner
+    }
+
+    public func diagnose(sourceApp: String) throws -> KeychainRecoveryDiagnosis {
+        let sourceIdentity = try inspector.inspect(executablePath: sourceApp)
+        let targetIdentity = try inspector.inspect(executablePath: targetExecutablePath)
+        try validateRecoveryPair(source: sourceIdentity, target: targetIdentity)
+
+        let sourceKeys = try sourceClient.listKeys(sourceExecutablePath: sourceIdentity.executablePath)
+        let targetKeys = try secretStore.listSecrets().map(\.key).sorted()
+        return KeychainRecoveryDiagnosis(
+            source: KeychainRecoveryAppSnapshot(identity: sourceIdentity, keys: sourceKeys),
+            target: KeychainRecoveryAppSnapshot(identity: targetIdentity, keys: targetKeys)
+        )
+    }
+
+    public func migrate(
+        sourceApp: String,
+        selection: KeychainRecoverySelection,
+        overwrite: Bool
+    ) throws -> KeychainRecoveryMigrationResult {
+        let diagnosis = try diagnose(sourceApp: sourceApp)
+        let plan = try planner.plan(
+            sourceKeys: diagnosis.source.keys,
+            targetKeys: diagnosis.target.keys,
+            selection: selection,
+            overwrite: overwrite
+        )
+
+        var migratedKeys: [String] = []
+        for key in plan.keysToMigrate {
+            let secretData = try sourceClient.readSecret(
+                sourceExecutablePath: diagnosis.source.identity.executablePath,
+                key: key,
+                agent: "Aegis Keychain Recovery"
+            )
+            try secretStore.setSecret(secretData, for: key)
+            migratedKeys.append(key)
+        }
+
+        return KeychainRecoveryMigrationResult(
+            source: diagnosis.source.identity,
+            target: diagnosis.target.identity,
+            migratedKeys: migratedKeys,
+            skippedAlreadyPresent: plan.skippedAlreadyPresent
+        )
+    }
+
+    private func validateRecoveryPair(source: SignedAegisAppIdentity, target: SignedAegisAppIdentity) throws {
+        guard source.teamIdentifier == target.teamIdentifier else {
+            throw AegisSecretError.runtime("Source and target apps are signed by different Apple teams; refusing recovery.")
+        }
+        guard source.applicationIdentifier.hasSuffix(".com.olympum.aegis-secret"),
+              target.applicationIdentifier.hasSuffix(".com.olympum.aegis-secret") else {
+            throw AegisSecretError.runtime("Source and target apps are not both Aegis Secret apps; refusing recovery.")
+        }
+        guard !source.primaryKeychainAccessGroup.isEmpty, !target.primaryKeychainAccessGroup.isEmpty else {
+            throw AegisSecretError.runtime("Source and target apps must both prove keychain access groups.")
+        }
+    }
+}
+
+public struct KeychainRecoveryRenderer {
+    public init() {}
+
+    public func render(diagnosis: KeychainRecoveryDiagnosis) -> String {
+        var lines: [String] = []
+        lines.append("Keychain recovery diagnosis")
+        lines.append("")
+        append(snapshot: diagnosis.source, label: "Source app", to: &lines)
+        lines.append("")
+        append(snapshot: diagnosis.target, label: "Target app", to: &lines)
+        lines.append("")
+        lines.append("Missing from target: \(diagnosis.missingFromTarget.count)")
+        append(keys: diagnosis.missingFromTarget, to: &lines)
+        lines.append("")
+        lines.append("Already present: \(diagnosis.alreadyPresent.count)")
+        append(keys: diagnosis.alreadyPresent, to: &lines)
+        lines.append("")
+        lines.append("No secret values were read by this diagnostic.")
+        return lines.joined(separator: "\n")
+    }
+
+    public func render(result: KeychainRecoveryMigrationResult) -> String {
+        var lines: [String] = []
+        lines.append("Keychain recovery migration")
+        lines.append("source_group: \(result.source.primaryKeychainAccessGroup)")
+        lines.append("target_group: \(result.target.primaryKeychainAccessGroup)")
+        lines.append("migrated: \(result.migratedKeys.count)")
+        append(keys: result.migratedKeys, to: &lines)
+        lines.append("skipped_already_present: \(result.skippedAlreadyPresent.count)")
+        append(keys: result.skippedAlreadyPresent, to: &lines)
+        lines.append("No secret values were printed.")
+        return lines.joined(separator: "\n")
+    }
+
+    private func append(snapshot: KeychainRecoveryAppSnapshot, label: String, to lines: inout [String]) {
+        lines.append("\(label):")
+        lines.append("  executable: \(snapshot.identity.executablePath)")
+        lines.append("  team_id: \(snapshot.identity.teamIdentifier)")
+        lines.append("  application_id: \(snapshot.identity.applicationIdentifier)")
+        lines.append("  keychain_group: \(snapshot.identity.primaryKeychainAccessGroup)")
+        lines.append("  key_count: \(snapshot.keys.count)")
+        append(keys: snapshot.keys, to: &lines)
+    }
+
+    private func append(keys: [String], to lines: inout [String]) {
+        guard !keys.isEmpty else {
+            lines.append("  (none)")
+            return
+        }
+        for key in keys {
+            lines.append("  \(key)")
+        }
+    }
+}
+
+private struct RecoveryProcessResult {
+    let stdout: Data
+    let stderr: Data
+    let exitCode: Int32
+}
+
 public struct CLIApplication {
     public let parser: CommandParser
     public let secretStore: SecretStore
     public let authenticator: DeviceAuthenticator
     public let commandStore: CommandStore
     public let wrappedCommandRunner: WrappedCommandRunner
+    public let currentExecutablePath: String
 
     public init(
         parser: CommandParser = CommandParser(),
         secretStore: SecretStore = KeychainSecretStore(),
         authenticator: DeviceAuthenticator = LocalDeviceAuthenticator(),
         commandStore: CommandStore = CommandStore(),
-        wrappedCommandRunner: WrappedCommandRunner? = nil
+        wrappedCommandRunner: WrappedCommandRunner? = nil,
+        currentExecutablePath: String = CommandLine.arguments.first ?? ""
     ) {
         self.parser = parser
         self.secretStore = secretStore
         self.authenticator = authenticator
         self.commandStore = commandStore
+        self.currentExecutablePath = currentExecutablePath
         self.wrappedCommandRunner = wrappedCommandRunner ?? WrappedCommandRunner(
             commandStore: commandStore,
             authenticator: authenticator,
@@ -2902,7 +3375,7 @@ public struct CLIApplication {
             }
         case .installUser:
             let installation = try UserInstaller(
-                currentExecutablePath: CommandLine.arguments[0],
+                currentExecutablePath: currentExecutablePath,
                 commandStore: commandStore
             ).install()
             print("Installed user shims for `\(installation.appBundleURL.path)`.")
@@ -2942,6 +3415,8 @@ public struct CLIApplication {
             try handleApprovalManagement(approvalCommand)
         case .guardCommand(let guardCommand):
             try await handleGuard(guardCommand)
+        case .recovery(let recoveryCommand):
+            try handleRecovery(recoveryCommand)
         case .run(let name, let args):
             let result = try await wrappedCommandRunner.run(
                 name: name,
@@ -2959,6 +3434,25 @@ public struct CLIApplication {
             }
         case .help:
             print(usageText)
+        }
+    }
+
+    private func handleRecovery(_ command: KeychainRecoveryCommand) throws {
+        let recovery = KeychainRecoveryTool(
+            targetExecutablePath: currentExecutablePath,
+            secretStore: secretStore
+        )
+        let renderer = KeychainRecoveryRenderer()
+
+        switch command {
+        case .diagnose(let sourceApp):
+            print(renderer.render(diagnosis: try recovery.diagnose(sourceApp: sourceApp)))
+        case .migrate(let sourceApp, let selection, let overwrite):
+            print(renderer.render(result: try recovery.migrate(
+                sourceApp: sourceApp,
+                selection: selection,
+                overwrite: overwrite
+            )))
         }
     }
 
@@ -3086,12 +3580,16 @@ Usage:
   aegis-secret command import <json-file>
   aegis-secret approval status [<command>] [--agent <agent>]
   aegis-secret guard shell [--command <shell-command>]
+  aegis-secret recovery diagnose --source-app <path-to-old-aegis-secret-binary>
+  aegis-secret recovery migrate --source-app <path-to-old-aegis-secret-binary> (--all | --key <key>) [--overwrite]
   aegis-secret run <name> -- <args...>
 
 Notes:
   `set` reads from the terminal by default, or from stdin when piped / passed `--stdin`.
   `get` is for explicit human use and reveals the raw secret on stdout after device-owner authentication.
   `install-user` creates PATH shims in `~/.local/bin` and registers user-scoped MCP integrations for installed Codex / Claude CLIs.
+  `recovery diagnose` reports signed app namespaces and key names only; it does not read secret values.
+  `recovery migrate` copies secrets from an older signed Aegis app into the current signed app without printing values.
   Aegis reads a managed base file from `~/.config/aegis-secret/commands.base.json` and overlays user changes from `~/.config/aegis-secret/commands.local.json`.
 """
 

@@ -171,6 +171,11 @@ any time, run:
 aegis-secret install-user
 ```
 
+If an older signed build used a different Keychain access group, secrets can
+remain intact but hidden from the current app. Use
+[`docs/keychain-recovery.md`](docs/keychain-recovery.md) to diagnose signed
+namespace splits and migrate accessible keys without printing secret values.
+
 ## Default Wrapped Commands
 
 Out of the box, Aegis ships wrappers for:
