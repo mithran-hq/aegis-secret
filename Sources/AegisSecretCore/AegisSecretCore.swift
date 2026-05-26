@@ -73,6 +73,12 @@ public struct SecretListItem: Equatable, Codable, Sendable {
     public init(key: String) {
         self.key = key
     }
+
+    public static func merged(_ groups: [SecretListItem]...) -> [SecretListItem] {
+        Set(groups.flatMap { $0.map(\.key) })
+            .sorted()
+            .map(SecretListItem.init(key:))
+    }
 }
 
 public protocol SecretStore: Sendable {
@@ -94,6 +100,11 @@ public struct KeychainSecretStore: SecretStore {
     public let serviceName: String
     public let metadataServiceName: String
 
+    private enum SecretCopyResult {
+        case success(Data)
+        case failure(OSStatus)
+    }
+
     public init(
         serviceName: String = aegisSecretServiceName,
         metadataServiceName: String = aegisSecretMetadataServiceName
@@ -103,10 +114,11 @@ public struct KeychainSecretStore: SecretStore {
     }
 
     public func setSecret(_ secretData: Data, for key: String) throws {
-        let deleteQuery = baseQuery(for: key)
-        let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            throw AegisSecretError.runtime("Unable to replace existing secret `\(key)`: \(message(for: deleteStatus)).")
+        for query in [baseQuery(for: key), legacyBaseQuery(for: key)] {
+            let deleteStatus = SecItemDelete(query as CFDictionary)
+            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+                throw AegisSecretError.runtime("Unable to replace existing secret `\(key)`: \(message(for: deleteStatus)).")
+            }
         }
 
         var accessControlError: Unmanaged<CFError>?
@@ -142,7 +154,28 @@ public struct KeychainSecretStore: SecretStore {
         context.localizedReason = reason
         context.localizedFallbackTitle = ""
 
-        var query = baseQuery(for: key)
+        let currentResult = copySecretData(query: baseQuery(for: key), context: context)
+        switch currentResult {
+        case .success(let data):
+            return data
+        case .failure(let status) where status == errSecItemNotFound:
+            let legacyResult = copySecretData(query: legacyBaseQuery(for: key), context: context)
+            switch legacyResult {
+            case .success(let data):
+                _ = try? upsertMetadata(for: key)
+                return data
+            case .failure(let legacyStatus) where legacyStatus == errSecItemNotFound:
+                throw AegisSecretError.runtime(readErrorMessage(for: key, status: status))
+            case .failure(let legacyStatus):
+                throw AegisSecretError.runtime(readErrorMessage(for: key, status: legacyStatus))
+            }
+        case .failure(let status):
+            throw AegisSecretError.runtime(readErrorMessage(for: key, status: status))
+        }
+    }
+
+    private func copySecretData(query: [String: Any], context: LAContext) -> SecretCopyResult {
+        var query = query
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecUseAuthenticationContext as String] = context
@@ -150,56 +183,78 @@ public struct KeychainSecretStore: SecretStore {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess else {
-            throw AegisSecretError.runtime(readErrorMessage(for: key, status: status))
+            return .failure(status)
         }
 
         guard let data = item as? Data else {
-            throw AegisSecretError.runtime("Keychain returned invalid data for `\(key)`.")
+            return .failure(errSecDecode)
         }
 
-        return data
+        return .success(data)
     }
 
     public func deleteSecret(for key: String) throws -> Bool {
         let status = SecItemDelete(baseQuery(for: key) as CFDictionary)
+        let legacyStatus = SecItemDelete(legacyBaseQuery(for: key) as CFDictionary)
         let metadataStatus = SecItemDelete(metadataQuery(for: key) as CFDictionary)
         guard metadataStatus == errSecSuccess || metadataStatus == errSecItemNotFound else {
             throw AegisSecretError.runtime("Unable to update secret index for `\(key)`: \(message(for: metadataStatus)).")
+        }
+        guard legacyStatus == errSecSuccess || legacyStatus == errSecItemNotFound else {
+            throw AegisSecretError.runtime("Unable to delete legacy secret `\(key)`: \(message(for: legacyStatus)).")
         }
 
         switch status {
         case errSecSuccess:
             return true
         case errSecItemNotFound:
-            return false
+            return legacyStatus == errSecSuccess
         default:
             throw AegisSecretError.runtime("Unable to delete secret `\(key)`: \(message(for: status)).")
         }
     }
 
     public func listSecrets() throws -> [SecretListItem] {
-        try listMetadataKeys()
+        try SecretListItem.merged(
+            listMetadataKeys(),
+            listStoredSecretKeys(useDataProtectionKeychain: true),
+            listStoredSecretKeys(useDataProtectionKeychain: false)
+        )
     }
 
     public func secretExists(for key: String) throws -> Bool {
         let context = LAContext()
         context.interactionNotAllowed = true
 
-        var query = baseQuery(for: key)
-        query[kSecReturnAttributes as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        query[kSecUseAuthenticationContext as String] = context
+        let currentStatus = copySecretAttributesStatus(query: baseQuery(for: key), context: context)
+        switch currentStatus {
+        case errSecSuccess, errSecInteractionNotAllowed:
+            return true
+        case errSecItemNotFound:
+            break
+        default:
+            throw AegisSecretError.runtime("Unable to check secret `\(key)`: \(message(for: currentStatus)).")
+        }
 
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        switch status {
+        let legacyStatus = copySecretAttributesStatus(query: legacyBaseQuery(for: key), context: context)
+        switch legacyStatus {
         case errSecSuccess, errSecInteractionNotAllowed:
             return true
         case errSecItemNotFound:
             return false
         default:
-            throw AegisSecretError.runtime("Unable to check secret `\(key)`: \(message(for: status)).")
+            throw AegisSecretError.runtime("Unable to check legacy secret `\(key)`: \(message(for: legacyStatus)).")
         }
+    }
+
+    private func copySecretAttributesStatus(query: [String: Any], context: LAContext) -> OSStatus {
+        var query = query
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecUseAuthenticationContext as String] = context
+
+        var item: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &item)
     }
 
     private func baseQuery(for key: String) -> [String: Any] {
@@ -208,6 +263,14 @@ public struct KeychainSecretStore: SecretStore {
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: key,
             kSecUseDataProtectionKeychain as String: true
+        ]
+    }
+
+    private func legacyBaseQuery(for key: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key
         ]
     }
 
@@ -264,6 +327,38 @@ public struct KeychainSecretStore: SecretStore {
             return []
         default:
             throw AegisSecretError.runtime("Unable to list secrets: \(message(for: status)).")
+        }
+    }
+
+    private func listStoredSecretKeys(useDataProtectionKeychain: Bool) throws -> [SecretListItem] {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecUseAuthenticationContext as String: context,
+        ]
+        if useDataProtectionKeychain {
+            query[kSecUseDataProtectionKeychain as String] = true
+        }
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            guard let dictionaries = item as? [[String: Any]] else {
+                throw AegisSecretError.runtime("Keychain returned an unexpected response while listing stored secrets.")
+            }
+            return dictionaries.compactMap { dictionary in
+                (dictionary[kSecAttrAccount as String] as? String).map(SecretListItem.init(key:))
+            }
+        case errSecItemNotFound, errSecInteractionNotAllowed:
+            return []
+        default:
+            throw AegisSecretError.runtime("Unable to list stored secrets: \(message(for: status)).")
         }
     }
 
@@ -3153,17 +3248,20 @@ public struct UserInstaller {
     public let environment: [String: String]
     public let fileManager: FileManager
     public let commandStore: CommandStore
+    public let homeDirectory: URL?
 
     public init(
         currentExecutablePath: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default,
-        commandStore: CommandStore = CommandStore()
+        commandStore: CommandStore = CommandStore(),
+        homeDirectory: URL? = nil
     ) {
         self.currentExecutablePath = currentExecutablePath
         self.environment = environment
         self.fileManager = fileManager
         self.commandStore = commandStore
+        self.homeDirectory = homeDirectory
     }
 
     public func install() throws -> UserInstallationSummary {
@@ -3176,7 +3274,7 @@ public struct UserInstaller {
         try commandStore.writeUserOverrideFileIfMissing()
 
         let executableURL = appBundleURL.appendingPathComponent("Contents/MacOS/aegis-secret")
-        let binDirectory = fileManager.homeDirectoryForCurrentUser
+        let binDirectory = resolvedHomeDirectory()
             .appendingPathComponent(".local/bin", isDirectory: true)
         try fileManager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
 
@@ -3243,6 +3341,10 @@ public struct UserInstaller {
         }
 
         throw AegisSecretError.runtime("`install-user` must be run from the signed Aegis Secret app bundle.")
+    }
+
+    private func resolvedHomeDirectory() -> URL {
+        homeDirectory ?? fileManager.homeDirectoryForCurrentUser
     }
 
     private func writeShim(
@@ -3323,7 +3425,7 @@ public struct UserInstaller {
     }
 
     private func installCodexHook(executableURL: URL) throws -> Bool {
-        let codexDirectory = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+        let codexDirectory = resolvedHomeDirectory().appendingPathComponent(".codex", isDirectory: true)
         let configURL = codexDirectory.appendingPathComponent("config.toml", isDirectory: false)
         guard fileManager.fileExists(atPath: configURL.path) else {
             return false
@@ -3347,7 +3449,7 @@ public struct UserInstaller {
     }
 
     private func installClaudeHook(executableURL: URL) throws -> Bool {
-        let settingsURL = fileManager.homeDirectoryForCurrentUser
+        let settingsURL = resolvedHomeDirectory()
             .appendingPathComponent(".claude", isDirectory: true)
             .appendingPathComponent("settings.json", isDirectory: false)
         guard fileManager.fileExists(atPath: settingsURL.path) else {
@@ -3367,7 +3469,7 @@ public struct UserInstaller {
     }
 
     private func updateCodexGuidance() throws -> Bool {
-        let guidanceURL = fileManager.homeDirectoryForCurrentUser
+        let guidanceURL = resolvedHomeDirectory()
             .appendingPathComponent(".codex", isDirectory: true)
             .appendingPathComponent("AGENTS.md", isDirectory: false)
         let guidance = bundledGuidance(
@@ -3379,7 +3481,7 @@ public struct UserInstaller {
     }
 
     private func updateClaudeGuidance() throws -> Bool {
-        let guidanceURL = fileManager.homeDirectoryForCurrentUser
+        let guidanceURL = resolvedHomeDirectory()
             .appendingPathComponent(".claude", isDirectory: true)
             .appendingPathComponent("CLAUDE.md", isDirectory: false)
         let guidance = bundledGuidance(

@@ -101,6 +101,15 @@ final class AegisSecretCoreTests: XCTestCase {
         )
     }
 
+    func testSecretListItemMergedDedupeAndSorts() {
+        let merged = SecretListItem.merged(
+            [SecretListItem(key: "ZED"), SecretListItem(key: "GITHUB_TOKEN")],
+            [SecretListItem(key: "AWS_TOKEN"), SecretListItem(key: "GITHUB_TOKEN")]
+        )
+
+        XCTAssertEqual(merged.map(\.key), ["AWS_TOKEN", "GITHUB_TOKEN", "ZED"])
+    }
+
     func testCommandValidateFileParses() throws {
         XCTAssertEqual(
             try CommandParser().parse(["command", "validate", "--file", "/tmp/commands.json"], stdinIsTTY: true),
@@ -1126,6 +1135,50 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertEqual(once, twice)
         XCTAssertTrue(once.contains("[features]\nhooks = true\nplugins = true"))
         XCTAssertTrue(once.contains("[tui]\ntheme = \"dark\""))
+    }
+
+    func testUserInstallerOverwritesExistingLocalBinaryWithShim() throws {
+        let tempDirectory = try temporaryDirectory()
+        let homeDirectory = tempDirectory.appendingPathComponent("home", isDirectory: true)
+        let appDirectory = tempDirectory.appendingPathComponent("Aegis Secret.app", isDirectory: true)
+        let macOSDirectory = appDirectory
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOSDirectory, withIntermediateDirectories: true)
+        let executableURL = try makeExecutable(
+            named: "aegis-secret",
+            in: macOSDirectory,
+            contents: "#!/bin/zsh\nexit 0\n"
+        )
+
+        let binDirectory = homeDirectory.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let existingBinaryURL = binDirectory.appendingPathComponent("aegis-secret", isDirectory: false)
+        try Data([0xCA, 0xFE, 0xBA, 0xBE]).write(to: existingBinaryURL)
+
+        let commandStore = CommandStore(
+            fileURL: homeDirectory
+                .appendingPathComponent(".config", isDirectory: true)
+                .appendingPathComponent("aegis-secret", isDirectory: true)
+                .appendingPathComponent("commands.local.json", isDirectory: false),
+            environment: ["HOME": homeDirectory.path, "PATH": ""]
+        )
+        let summary = try UserInstaller(
+            currentExecutablePath: executableURL.path,
+            environment: ["HOME": homeDirectory.path, "PATH": ""],
+            commandStore: commandStore,
+            homeDirectory: homeDirectory
+        ).install()
+
+        let installedShim = try String(contentsOf: existingBinaryURL, encoding: .utf8)
+        XCTAssertEqual(summary.appBundleURL.path, appDirectory.path)
+        XCTAssertTrue(installedShim.hasPrefix("#!/bin/zsh\n"))
+        XCTAssertTrue(installedShim.contains("exec '\(executableURL.path)' \"$@\""))
+        XCTAssertEqual(
+            try String(contentsOf: binDirectory.appendingPathComponent("aegis-broker"), encoding: .utf8),
+            installedShim
+        )
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: existingBinaryURL.path))
     }
 
     private func temporaryDirectory() throws -> URL {
