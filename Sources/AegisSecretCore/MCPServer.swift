@@ -134,20 +134,30 @@ private struct ListCommandsToolResponse: Encodable {
     let receipt: ToolDecisionReceipt
 }
 
+private struct ListRemoteActionsToolResponse: Encodable {
+    let actions: [RemoteAuthorityActionDescriptor]
+}
+
 public final class StdioMCPServer {
     private let commandStore: CommandStore
     private let runner: WrappedCommandRunner
+    private let remoteActionRunner: RemoteAuthorityActionRunner
     private let agentName: String?
     private let receiptRecorder: ToolDecisionReceiptRecorder
 
     public init(
         commandStore: CommandStore = CommandStore(),
         runner: WrappedCommandRunner? = nil,
+        remoteActionRunner: RemoteAuthorityActionRunner? = nil,
         agentName: String? = ProcessInfo.processInfo.environment["AEGIS_SECRET_AGENT_NAME"],
         receiptRecorder: ToolDecisionReceiptRecorder = ToolDecisionReceiptRecorder()
     ) {
         self.commandStore = commandStore
-        self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore, secretStore: KeychainSecretStore())
+        let secretStore = KeychainSecretStore()
+        self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore, secretStore: secretStore)
+        self.remoteActionRunner = remoteActionRunner ?? RemoteAuthorityActionRunner(
+            leaseProvider: SecretStoreRemoteAuthorityLeaseProvider(secretStore: secretStore)
+        )
         self.agentName = agentName
         self.receiptRecorder = receiptRecorder
     }
@@ -235,6 +245,24 @@ public final class StdioMCPServer {
                 )
                 try? receiptRecorder.record(receipt)
                 try emitToolResult(id: id, payload: ListCommandsToolResponse(commands: commands, receipt: receipt))
+            case "list_remote_actions":
+                try emitToolResult(id: id, payload: ListRemoteActionsToolResponse(actions: remoteActionRunner.listActions()))
+            case "run_remote_action":
+                guard let actionID = arguments["action_id"]?.stringValue else {
+                    try emitToolError(id: id, message: "Missing `action_id`.")
+                    return
+                }
+                guard let payload = arguments["payload"] else {
+                    try emitToolError(id: id, message: "Missing `payload`.")
+                    return
+                }
+                let requester = arguments["requester"]?.stringValue ?? agentName ?? "MCP client"
+                let result = try await remoteActionRunner.run(RemoteAuthorityActionRequest(
+                    actionID: actionID,
+                    payload: payload,
+                    requester: requester
+                ))
+                try emitToolResult(id: id, payload: result)
             case "run_command":
                 guard let commandName = arguments["name"]?.stringValue else {
                     try emitToolError(id: id, message: "Missing `name`.")
@@ -311,6 +339,57 @@ public final class StdioMCPServer {
                         "receipt": .object([
                             "description": .string("D37-compatible decision receipt written to the local JSONL handoff file.")
                         ])
+                    ]),
+                ]
+            ),
+            ToolDescriptor(
+                name: "list_remote_actions",
+                title: "List brokered remote-authority actions",
+                description: "List the typed GitHub/source-control remote-authority actions that Aegis Broker can run without exposing reusable worker write credentials.",
+                inputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                ],
+                outputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "actions": .object([
+                            "type": .string("array")
+                        ])
+                    ]),
+                ]
+            ),
+            ToolDescriptor(
+                name: "run_remote_action",
+                title: "Run brokered remote-authority action",
+                description: "Run a supported typed GitHub/source-control mutation through Aegis Broker with scoped lease materialization, Bruno gating when required, and redaction-safe evidence.",
+                inputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "action_id": .object([
+                            "type": .string("string"),
+                            "description": .string("Typed action id, such as github.issue.comment or github.issue.close.")
+                        ]),
+                        "payload": .object([
+                            "type": .string("object"),
+                            "description": .string("Typed action payload. Must include repo, resource number, grant_ref, auth_lease_ref, and broker-local credential_ref.")
+                        ]),
+                        "requester": .object([
+                            "type": .string("string"),
+                            "description": .string("Optional caller label recorded in evidence.")
+                        ]),
+                    ]),
+                    "required": .array([
+                        .string("action_id"),
+                        .string("payload"),
+                    ]),
+                ],
+                outputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "status": .object(["type": .string("string")]),
+                        "action_id": .object(["type": .string("string")]),
+                        "evidence": .object(["description": .string("D79 remote-authority evidence with metadata-only redaction.")]),
                     ]),
                 ]
             ),

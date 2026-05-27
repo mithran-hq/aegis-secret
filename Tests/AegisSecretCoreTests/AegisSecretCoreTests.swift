@@ -59,6 +59,22 @@ struct StubBrunoGuardEvaluator: BrunoGuardEvaluating {
     }
 }
 
+struct StubRemoteAuthorityLeaseProvider: RemoteAuthorityLeaseProviding {
+    let handler: @Sendable (RemoteAuthorityActionRequest, RemoteAuthorityActionDescriptor) async throws -> RemoteAuthorityLease
+
+    func lease(for request: RemoteAuthorityActionRequest, descriptor: RemoteAuthorityActionDescriptor) async throws -> RemoteAuthorityLease {
+        try await handler(request, descriptor)
+    }
+}
+
+struct StubGitHubRemoteAuthorityClient: GitHubRemoteAuthorityClient {
+    let handler: @Sendable (GitHubRemoteAuthorityOperation, String) async throws -> RemoteAuthorityActionOutput
+
+    func execute(operation: GitHubRemoteAuthorityOperation, token: String) async throws -> RemoteAuthorityActionOutput {
+        try await handler(operation, token)
+    }
+}
+
 final class AegisSecretCoreTests: XCTestCase {
     func testHelpWhenNoArguments() throws {
         XCTAssertEqual(try CommandParser().parse([], stdinIsTTY: true), .help)
@@ -571,6 +587,138 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertFalse(encodedReceipt.contains("secret-token-123"))
         XCTAssertFalse(encodedReceipt.contains("github-app-token"))
         XCTAssertEqual(result.receipt.redaction.rawSecretMCPCRUDAvailable, false)
+    }
+
+    func testRemoteAuthorityGitHubIssueCommentSucceedsWithScopedLeaseAndEvidence() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { request, descriptor in
+                XCTAssertEqual(request.actionID, "github.issue.comment")
+                XCTAssertEqual(descriptor.grantClass, "github_issue_pr_mutation")
+                return RemoteAuthorityLease(
+                    authLeaseRef: "auth-lease://github-app/aegis-secret/issues",
+                    grantRef: "auth-grant://github_issue_pr_mutation/aegis-secret",
+                    token: "secret-token-123"
+                )
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { operation, token in
+                XCTAssertEqual(token, "secret-token-123")
+                XCTAssertEqual(operation.method, "POST")
+                XCTAssertEqual(operation.path, "/repos/mithran-hq/aegis-secret/issues/23/comments")
+                XCTAssertEqual(operation.body, .object(["body": .string("Evidence evidence://d79/smoke")]))
+                return RemoteAuthorityActionOutput(
+                    statusCode: 201,
+                    resourceRef: "github://mithran-hq/aegis-secret/issues/23#issuecomment-1",
+                    responseSHA256: "sha256:abc123"
+                )
+            },
+            brunoEvaluator: StubBrunoGuardEvaluator { _ in
+                XCTFail("issue comments do not require Bruno in the initial catalog")
+                return BrunoGuardDecision(decision: "deny")
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+
+        let result = try await runner.run(RemoteAuthorityActionRequest(
+            actionID: "github.issue.comment",
+            payload: remoteIssuePayload(body: "Evidence evidence://d79/smoke"),
+            requester: "Codex"
+        ))
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.evidence.schemaVersion, "aegis.broker.remote_authority_evidence.v1")
+        XCTAssertEqual(result.evidence.actionID, "github.issue.comment")
+        XCTAssertEqual(result.evidence.repoRef, "github://mithran-hq/aegis-secret")
+        XCTAssertEqual(result.evidence.resourceScopeRef, "github://mithran-hq/aegis-secret/issues/23")
+        XCTAssertEqual(result.evidence.authLeaseRef, "auth-lease://github-app/aegis-secret/issues")
+        XCTAssertEqual(result.evidence.result, "allowed")
+        XCTAssertEqual(result.evidence.cleanupStatus, "credentials_dropped")
+        XCTAssertFalse(result.evidence.rawCredentialMaterialPrinted)
+        XCTAssertFalse(encoded.contains("secret-token-123"))
+        XCTAssertFalse(encoded.contains("\(secretEnvironmentReferencePrefix)github-app-token"))
+    }
+
+    func testRemoteAuthorityGitHubIssueCloseFailsClosedWhenBrunoDenies() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                XCTFail("lease should not be requested after Bruno denial")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "auth-grant://unexpected", token: "secret-token-123")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called after Bruno denial")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            brunoEvaluator: StubBrunoGuardEvaluator { event in
+                guard case .object(let root) = event,
+                      case .object(let action)? = root["action"] else {
+                    XCTFail("expected Bruno event")
+                    return BrunoGuardDecision(decision: "deny")
+                }
+                XCTAssertEqual(action["kind"], .string("github.issue.close"))
+                return BrunoGuardDecision(decision: "deny", recommendedNextPrompt: "Add closure evidence.")
+            }
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.issue.close",
+                payload: remoteIssuePayload(body: nil),
+                requester: "Codex"
+            ))
+            XCTFail("expected Bruno denial")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_bruno_denied"))
+            XCTAssertTrue(error.description.contains("Add closure evidence."))
+        }
+    }
+
+    func testRemoteAuthorityFailsClosedWhenLeaseIsDenied() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                throw AegisSecretError.blocked("broker_auth_lease_denied: grant refused")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called without a lease")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.issue.comment",
+                payload: remoteIssuePayload(body: "hello"),
+                requester: "Codex"
+            ))
+            XCTFail("expected lease failure")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_auth_lease_denied"))
+        }
+    }
+
+    func testRemoteAuthorityUnsupportedTypedActionFailsClosed() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                XCTFail("lease should not be requested for unsupported actions")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "auth-grant://unexpected", token: "secret-token-123")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called for unsupported actions")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.repo.delete",
+                payload: remoteIssuePayload(body: nil),
+                requester: "Codex"
+            ))
+            XCTFail("expected unsupported action failure")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_action_unsupported"))
+        }
     }
 
     func testRunnerReusesPersistedApprovalAcrossCachesForSameAgent() async throws {
@@ -1292,6 +1440,28 @@ final class AegisSecretCoreTests: XCTestCase {
         try contents.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
+    }
+
+    private func remoteIssuePayload(body: String?) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "repo": .string("mithran-hq/aegis-secret"),
+            "issue_number": .integer(23),
+            "project_ref": .string("project://d79"),
+            "session_ref": .string("agent-session://local/test"),
+            "auth_lease_ref": .string("auth-lease://github-app/aegis-secret/issues"),
+            "grant_ref": .string("auth-grant://github_issue_pr_mutation/aegis-secret"),
+            "credential_ref": .string("\(secretEnvironmentReferencePrefix)github-app-token"),
+            "evidence_refs": .array([
+                .object([
+                    "ref": .string("evidence://d79/smoke"),
+                    "redaction_state": .string("metadata_only"),
+                ])
+            ]),
+        ]
+        if let body {
+            payload["body"] = .string(body)
+        }
+        return .object(payload)
     }
 
     private func writeLeaseFile(_ file: ApprovalLeaseFile, to url: URL) throws {
