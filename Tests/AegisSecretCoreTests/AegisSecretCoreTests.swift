@@ -1293,6 +1293,34 @@ final class AegisSecretCoreTests: XCTestCase {
 
         XCTAssertFalse(result.allowed)
         XCTAssertTrue(result.message.contains("privileged command `gh`"))
+        XCTAssertTrue(result.message.contains("list_commands"))
+        XCTAssertTrue(result.message.contains("run_command"))
+    }
+
+    func testShellGuardBrokerRequiredMessageDoesNotEchoSecretLikeArguments() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "terraform", denyPrefixes: [["apply"]])
+        ]).evaluate(command: "terraform apply -var password=super-secret-token")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Aegis Broker MCP"))
+        XCTAssertFalse(result.message.contains("super-secret-token"))
+        XCTAssertFalse(result.message.contains("password="))
+    }
+
+    func testCodexPreToolUseDenyHookOutputUsesSupportedShape() throws {
+        let output = try codexPreToolUseDenyHookOutput(
+            reason: "Use Aegis Broker MCP `list_commands`, then `run_command`."
+        )
+        let root = try jsonDictionary(from: Data(output.utf8))
+        let hookSpecificOutput = try XCTUnwrap(root["hookSpecificOutput"] as? [String: Any])
+
+        XCTAssertEqual(hookSpecificOutput["hookEventName"] as? String, "PreToolUse")
+        XCTAssertEqual(hookSpecificOutput["permissionDecision"] as? String, "deny")
+        XCTAssertEqual(
+            hookSpecificOutput["permissionDecisionReason"] as? String,
+            "Use Aegis Broker MCP `list_commands`, then `run_command`."
+        )
     }
 
     func testShellGuardAllowsEnvironmentPrefixedGhRead() async {

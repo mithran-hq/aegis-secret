@@ -262,8 +262,10 @@ Expected agent flow:
 If the agent calls a protected or privileged command through the shell, the
 installed Claude/Codex hook runs `aegis-secret guard shell`. Protected GitHub
 method mutations may be checked by Bruno. Privileged credentialed commands may
-be blocked with exit code `2`, and the feedback tells the agent to use Aegis
-Broker MCP `list_commands` and `run_command`.
+be denied by the Codex PreToolUse hook with schema-valid JSON. Manual
+`aegis-secret guard shell --command ...` smoke checks still exit `2`. In both
+paths, the feedback tells the agent to use Aegis Broker MCP `list_commands` and
+`run_command`.
 
 Expected behavior for denied commands:
 
@@ -360,7 +362,8 @@ Expected smoke results:
   expiry, policy changes, executable path changes, hook JSON extraction, and
   idempotent Claude/Codex hook updates.
 - `./scripts/ci_local.sh` passes.
-- direct shell guard smoke blocks the privileged command and exits `2`.
+- direct shell guard smoke blocks the privileged command and exits `2`; Codex
+  hook/stdin guard blocks use PreToolUse deny JSON.
 - MCP allow smoke succeeds when an agent uses Aegis MCP `list_commands` followed
   by `run_command` for an allowed wrapped command, such as `gh api /user`.
 
