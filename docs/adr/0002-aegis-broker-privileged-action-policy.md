@@ -133,6 +133,15 @@ or equivalent message fields. If a protected close, merge, or release mutation
 does not carry evidence refs, Bruno should deny or the broker should fail the
 gate before execution.
 
+PR merge has an additional identity invariant. Direct `gh pr merge` is denied
+in protected mode and rerouted to the Broker MCP `run_remote_action` tool with
+action id `github.pr.merge`. Broker reads the effective `git config user.email`
+from the supplied checkout `cwd`, validates it against repository-owner policy,
+and sends it to GitHub through GraphQL `MergePullRequestInput.authorEmail`.
+Broker must not accept `author_email` from the agent payload and must not write
+Git config. If `user.email` is absent or invalid, the action fails closed with a
+fix-the-checkout-Git-config remediation.
+
 Bruno returns `bruno.guard_decision.v1`:
 
 ```json

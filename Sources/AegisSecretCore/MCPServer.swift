@@ -416,7 +416,7 @@ public final class StdioMCPServer {
                         ]),
                         "payload": .object([
                             "type": .string("object"),
-                            "description": .string("Typed action payload. Must include repo, resource number, grant_ref, auth_lease_ref, and broker-local credential_ref.")
+                            "description": .string("Typed action payload. Must include repo, resource number, grant_ref, auth_lease_ref, and broker-local credential_ref. github.pr.merge also requires cwd so Broker can read git config user.email.")
                         ]),
                         "requester": .object([
                             "type": .string("string"),

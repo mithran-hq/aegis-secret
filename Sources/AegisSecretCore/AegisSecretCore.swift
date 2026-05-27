@@ -1951,15 +1951,55 @@ public struct SecretStoreRemoteAuthorityLeaseProvider: RemoteAuthorityLeaseProvi
     }
 }
 
+public struct GitHubPullRequestMergeGraphQLOperation: Equatable, Sendable {
+    public let repo: String
+    public let pullRequestNumber: Int
+    public let mergeMethod: String
+    public let authorEmail: String
+    public let expectedHeadOid: String?
+    public let commitHeadline: String?
+    public let commitBody: String?
+
+    public init(
+        repo: String,
+        pullRequestNumber: Int,
+        mergeMethod: String,
+        authorEmail: String,
+        expectedHeadOid: String? = nil,
+        commitHeadline: String? = nil,
+        commitBody: String? = nil
+    ) {
+        self.repo = repo
+        self.pullRequestNumber = pullRequestNumber
+        self.mergeMethod = mergeMethod
+        self.authorEmail = authorEmail
+        self.expectedHeadOid = expectedHeadOid
+        self.commitHeadline = commitHeadline
+        self.commitBody = commitBody
+    }
+}
+
+public enum GitHubRemoteAuthorityOperationKind: Equatable, Sendable {
+    case rest
+    case graphQLPullRequestMerge(GitHubPullRequestMergeGraphQLOperation)
+}
+
 public struct GitHubRemoteAuthorityOperation: Equatable, Sendable {
     public let method: String
     public let path: String
     public let body: JSONValue?
+    public let kind: GitHubRemoteAuthorityOperationKind
 
-    public init(method: String, path: String, body: JSONValue?) {
+    public init(
+        method: String,
+        path: String,
+        body: JSONValue?,
+        kind: GitHubRemoteAuthorityOperationKind = .rest
+    ) {
         self.method = method
         self.path = path
         self.body = body
+        self.kind = kind
     }
 }
 
@@ -1993,6 +2033,10 @@ public struct URLSessionGitHubRemoteAuthorityClient: GitHubRemoteAuthorityClient
     }
 
     public func execute(operation: GitHubRemoteAuthorityOperation, token: String) async throws -> RemoteAuthorityActionOutput {
+        if case .graphQLPullRequestMerge(let merge) = operation.kind {
+            return try await executePullRequestMerge(merge, token: token)
+        }
+
         let base = apiBaseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(base)/\(operation.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))") else {
             throw AegisSecretError.blocked("broker_remote_action_failed: GitHub API URL was invalid.")
@@ -2016,6 +2060,185 @@ public struct URLSessionGitHubRemoteAuthorityClient: GitHubRemoteAuthorityClient
             resourceRef: nil,
             responseSHA256: "sha256:\(sha256Hex(data))"
         )
+    }
+
+    private func executePullRequestMerge(
+        _ merge: GitHubPullRequestMergeGraphQLOperation,
+        token: String
+    ) async throws -> RemoteAuthorityActionOutput {
+        let parts = merge.repo.split(separator: "/")
+        guard parts.count == 2 else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub repo scope was invalid.")
+        }
+        let owner = String(parts[0])
+        let name = String(parts[1])
+
+        let lookup = try await executeGraphQL(
+            query: """
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  id
+                  headRefOid
+                }
+              }
+            }
+            """,
+            variables: [
+                "owner": owner,
+                "name": name,
+                "number": merge.pullRequestNumber,
+            ],
+            token: token
+        )
+        guard let repository = lookup["repository"] as? [String: Any],
+              let pullRequest = repository["pullRequest"] as? [String: Any],
+              let pullRequestID = pullRequest["id"] as? String else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub pull request lookup failed.")
+        }
+
+        var input: [String: Any] = [
+            "pullRequestId": pullRequestID,
+            "mergeMethod": merge.mergeMethod.uppercased(),
+            "authorEmail": merge.authorEmail,
+        ]
+        if let expectedHeadOid = merge.expectedHeadOid ?? pullRequest["headRefOid"] as? String {
+            input["expectedHeadOid"] = expectedHeadOid
+        }
+        if let commitHeadline = merge.commitHeadline {
+            input["commitHeadline"] = commitHeadline
+        }
+        if let commitBody = merge.commitBody {
+            input["commitBody"] = commitBody
+        }
+
+        let mutation = try await executeGraphQL(
+            query: """
+            mutation($input: MergePullRequestInput!) {
+              mergePullRequest(input: $input) {
+                pullRequest {
+                  id
+                  number
+                  merged
+                }
+              }
+            }
+            """,
+            variables: ["input": input],
+            token: token
+        )
+        let responseData = try JSONSerialization.data(withJSONObject: mutation, options: [.sortedKeys])
+        return RemoteAuthorityActionOutput(
+            statusCode: 200,
+            resourceRef: "github://\(merge.repo)/pull/\(merge.pullRequestNumber)",
+            responseSHA256: "sha256:\(sha256Hex(responseData))"
+        )
+    }
+
+    private func executeGraphQL(
+        query: String,
+        variables: [String: Any],
+        token: String
+    ) async throws -> [String: Any] {
+        let base = apiBaseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(base)/graphql") else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub GraphQL URL was invalid.")
+        }
+        let body: [String: Any] = [
+            "query": query,
+            "variables": variables,
+        ]
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200...299).contains(status) else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub GraphQL returned HTTP \(status).")
+        }
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub GraphQL response was invalid.")
+        }
+        if let errors = root["errors"] as? [[String: Any]], !errors.isEmpty {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub GraphQL returned errors.")
+        }
+        guard let data = root["data"] as? [String: Any] else {
+            throw AegisSecretError.blocked("broker_remote_action_failed: GitHub GraphQL response omitted data.")
+        }
+        return data
+    }
+}
+
+public struct GitAuthorIdentity: Equatable, Sendable {
+    public let email: String
+    public let emailOrigin: String?
+    public let remoteOriginURL: String?
+
+    public init(email: String, emailOrigin: String?, remoteOriginURL: String?) {
+        self.email = email
+        self.emailOrigin = emailOrigin
+        self.remoteOriginURL = remoteOriginURL
+    }
+}
+
+public protocol GitAuthorIdentityProviding: Sendable {
+    func identity(cwd: String) throws -> GitAuthorIdentity
+}
+
+public struct ProcessGitAuthorIdentityProvider: GitAuthorIdentityProviding {
+    public init() {}
+
+    public func identity(cwd: String) throws -> GitAuthorIdentity {
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw AegisSecretError.blocked("broker_policy_denied: PR merge requires a valid checkout cwd.")
+        }
+        let emailOutput: String
+        do {
+            emailOutput = try runGit(["config", "--get", "user.email"], cwd: cwd)
+        } catch {
+            throw AegisSecretError.blocked("broker_policy_denied: PR merge requires `git config user.email` in the checkout. Set the checkout Git identity before retrying.")
+        }
+        let email = emailOutput.trimmedNonEmpty
+        guard let email else {
+            throw AegisSecretError.blocked("broker_policy_denied: PR merge requires `git config user.email` in the checkout. Set the checkout Git identity before retrying.")
+        }
+        let origin = try? runGit(["config", "--show-origin", "--get", "user.email"], cwd: cwd).trimmedNonEmpty
+        let remote = try? runGit(["remote", "get-url", "origin"], cwd: cwd).trimmedNonEmpty
+        return GitAuthorIdentity(email: email, emailOrigin: origin, remoteOriginURL: remote)
+    }
+
+    private func runGit(_ args: [String], cwd: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", cwd] + args
+        let output = Pipe()
+        let error = Pipe()
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AegisSecretError.blocked("broker_policy_denied: PR merge requires readable Git identity in the checkout.")
+        }
+        return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    }
+}
+
+public struct RemoteAuthorityAuthorIdentityEvidence: Codable, Equatable, Sendable {
+    public let emailDomain: String
+    public let emailSHA256: String
+    public let emailOriginKind: String
+
+    private enum CodingKeys: String, CodingKey {
+        case emailDomain = "email_domain"
+        case emailSHA256 = "email_sha256"
+        case emailOriginKind = "email_origin_kind"
     }
 }
 
@@ -2043,6 +2266,7 @@ public struct RemoteAuthorityActionEvidence: Codable, Equatable, Sendable {
     public let redactionState: String
     public let rawCredentialMaterialPrinted: Bool
     public let output: RemoteAuthorityActionOutput?
+    public let authorIdentity: RemoteAuthorityAuthorIdentityEvidence?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -2068,6 +2292,7 @@ public struct RemoteAuthorityActionEvidence: Codable, Equatable, Sendable {
         case redactionState = "redaction_state"
         case rawCredentialMaterialPrinted = "raw_credential_material_printed"
         case output
+        case authorIdentity = "author_identity"
     }
 }
 
@@ -2093,6 +2318,7 @@ public struct RemoteAuthorityActionRunner: Sendable {
     public let catalog: RemoteAuthorityActionCatalog
     public let leaseProvider: any RemoteAuthorityLeaseProviding
     public let githubClient: any GitHubRemoteAuthorityClient
+    public let gitIdentityProvider: any GitAuthorIdentityProviding
     public let brunoEvaluator: (any BrunoGuardEvaluating)?
     public let now: @Sendable () -> Date
 
@@ -2100,12 +2326,14 @@ public struct RemoteAuthorityActionRunner: Sendable {
         catalog: RemoteAuthorityActionCatalog = RemoteAuthorityActionCatalog(),
         leaseProvider: any RemoteAuthorityLeaseProviding,
         githubClient: any GitHubRemoteAuthorityClient = URLSessionGitHubRemoteAuthorityClient(),
+        gitIdentityProvider: any GitAuthorIdentityProviding = ProcessGitAuthorIdentityProvider(),
         brunoEvaluator: (any BrunoGuardEvaluating)? = ProcessBrunoGuardEvaluator(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.catalog = catalog
         self.leaseProvider = leaseProvider
         self.githubClient = githubClient
+        self.gitIdentityProvider = gitIdentityProvider
         self.brunoEvaluator = brunoEvaluator
         self.now = now
     }
@@ -2122,6 +2350,7 @@ public struct RemoteAuthorityActionRunner: Sendable {
         guard safeGitHubRepo(repo) else {
             throw AegisSecretError.blocked("broker_policy_denied: repo scope is unsafe.")
         }
+        let authorIdentity = try authorIdentityEvidenceIfNeeded(actionID: request.actionID, repo: repo, payload: payload)
         let resourceScopeRef = try resourceScopeRef(actionID: request.actionID, repo: repo, payload: payload)
         let projectRef = stringValue(payload["project_ref"]) ?? "project://local"
 
@@ -2132,7 +2361,7 @@ public struct RemoteAuthorityActionRunner: Sendable {
             resourceScopeRef: resourceScopeRef
         )
         let lease = try await leaseProvider.lease(for: request, descriptor: descriptor)
-        let operation = try githubOperation(actionID: request.actionID, repo: repo, payload: payload)
+        let operation = try githubOperation(actionID: request.actionID, repo: repo, payload: payload, authorEmail: authorIdentity?.email)
         let output = try await githubClient.execute(operation: operation, token: lease.token)
         let evidence = RemoteAuthorityActionEvidence(
             schemaVersion: "aegis.broker.remote_authority_evidence.v1",
@@ -2160,9 +2389,36 @@ public struct RemoteAuthorityActionRunner: Sendable {
             cleanupStatus: "credentials_dropped",
             redactionState: "metadata_only",
             rawCredentialMaterialPrinted: false,
-            output: output
+            output: output,
+            authorIdentity: authorIdentity?.evidence
         )
         return RemoteAuthorityActionInvocationResult(status: "ok", actionID: request.actionID, evidence: evidence)
+    }
+
+    private func authorIdentityEvidenceIfNeeded(
+        actionID: String,
+        repo: String,
+        payload: [String: JSONValue]
+    ) throws -> (email: String, evidence: RemoteAuthorityAuthorIdentityEvidence)? {
+        guard actionID == "github.pr.merge" else {
+            return nil
+        }
+        let cwd = try requiredString(payload, "cwd")
+        let identity = try gitIdentityProvider.identity(cwd: cwd)
+        try validateAuthorEmail(identity.email, repo: repo)
+        if let remoteOriginURL = identity.remoteOriginURL,
+           let originRepo = gitHubRepo(fromRemoteURL: remoteOriginURL),
+           originRepo != repo {
+            throw AegisSecretError.blocked("broker_policy_denied: checkout origin does not match PR merge repo.")
+        }
+        return (
+            identity.email,
+            RemoteAuthorityAuthorIdentityEvidence(
+                emailDomain: emailDomain(identity.email),
+                emailSHA256: "sha256:\(sha256Hex(Data(identity.email.utf8)))",
+                emailOriginKind: gitConfigOriginKind(identity.emailOrigin)
+            )
+        )
     }
 
     private func evaluateBrunoIfNeeded(
@@ -2300,7 +2556,12 @@ private func resourceScopeRef(actionID: String, repo: String, payload: [String: 
     throw AegisSecretError.blocked("broker_action_unsupported: typed action `\(actionID)` is not supported.")
 }
 
-private func githubOperation(actionID: String, repo: String, payload: [String: JSONValue]) throws -> GitHubRemoteAuthorityOperation {
+private func githubOperation(
+    actionID: String,
+    repo: String,
+    payload: [String: JSONValue],
+    authorEmail: String? = nil
+) throws -> GitHubRemoteAuthorityOperation {
     switch actionID {
     case "github.issue.comment":
         let issue = try requiredInteger(payload, "issue_number")
@@ -2338,10 +2599,22 @@ private func githubOperation(actionID: String, repo: String, payload: [String: J
         guard ["merge", "squash", "rebase"].contains(mergeMethod) else {
             throw AegisSecretError.blocked("broker_policy_denied: unsupported PR merge method.")
         }
+        guard let authorEmail else {
+            throw AegisSecretError.blocked("broker_policy_denied: PR merge requires Broker-derived git author email.")
+        }
         return GitHubRemoteAuthorityOperation(
-            method: "PUT",
-            path: "/repos/\(repo)/pulls/\(pullRequest)/merge",
-            body: .object(["merge_method": .string(mergeMethod)])
+            method: "POST",
+            path: "/graphql",
+            body: nil,
+            kind: .graphQLPullRequestMerge(GitHubPullRequestMergeGraphQLOperation(
+                repo: repo,
+                pullRequestNumber: pullRequest,
+                mergeMethod: mergeMethod,
+                authorEmail: authorEmail,
+                expectedHeadOid: stringValue(payload["expected_head_oid"]),
+                commitHeadline: stringValue(payload["commit_headline"]),
+                commitBody: stringValue(payload["commit_body"])
+            ))
         )
     case "github.pr.label":
         let pullRequest = try requiredInteger(payload, "pr_number")
@@ -2357,6 +2630,92 @@ private func githubOperation(actionID: String, repo: String, payload: [String: J
     default:
         throw AegisSecretError.blocked("broker_action_unsupported: typed action `\(actionID)` is not supported.")
     }
+}
+
+private func validateAuthorEmail(_ value: String, repo: String) throws {
+    guard isSafeEmail(value) else {
+        throw AegisSecretError.blocked("broker_policy_denied: git author email is invalid or unsafe.")
+    }
+    let owner = repo.split(separator: "/").first.map(String.init) ?? ""
+    let domain = emailDomain(value)
+    let allowedDomains = allowedAuthorEmailDomains(forOwner: owner)
+    guard allowedDomains.isEmpty || allowedDomains.contains(domain) || isGitHubNoReplyEmail(value) else {
+        throw AegisSecretError.blocked("broker_policy_denied: git author email is not allowed for this repository owner.")
+    }
+}
+
+private func allowedAuthorEmailDomains(forOwner owner: String) -> Set<String> {
+    switch owner {
+    case "mithran-hq":
+        return ["mithran.ai"]
+    case "getnexar":
+        return ["getnexar.com"]
+    case "olympum":
+        return ["olympum.com"]
+    default:
+        return []
+    }
+}
+
+private func isSafeEmail(_ value: String) -> Bool {
+    let parts = value.split(separator: "@", omittingEmptySubsequences: false)
+    guard parts.count == 2 else { return false }
+    guard !parts[0].isEmpty, !parts[1].isEmpty, value.count <= 254 else { return false }
+    return value.allSatisfy { character in
+        character.isASCII &&
+        !character.isWhitespace &&
+        character != "/" &&
+        character != "\\" &&
+        character != "\"" &&
+        character != "'"
+    }
+}
+
+private func emailDomain(_ value: String) -> String {
+    value.split(separator: "@").last.map { String($0).lowercased() } ?? "unknown"
+}
+
+private func isGitHubNoReplyEmail(_ value: String) -> Bool {
+    value.lowercased().hasSuffix("@users.noreply.github.com")
+}
+
+private func gitConfigOriginKind(_ value: String?) -> String {
+    guard let value = value?.lowercased() else {
+        return "unknown"
+    }
+    if value.contains(".git/config") {
+        return "local"
+    }
+    if value.contains(".gitconfig-") {
+        return "include"
+    }
+    if value.contains(".gitconfig") {
+        return "global"
+    }
+    if value.hasPrefix("file:") {
+        return "file"
+    }
+    return "unknown"
+}
+
+private func gitHubRepo(fromRemoteURL value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("git@github.com:") {
+        return normalizeGitHubRepo(String(trimmed.dropFirst("git@github.com:".count)))
+    }
+    if let url = URL(string: trimmed),
+       url.host?.lowercased() == "github.com" {
+        return normalizeGitHubRepo(url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+    }
+    return nil
+}
+
+private func normalizeGitHubRepo(_ value: String) -> String? {
+    var repo = value
+    if repo.hasSuffix(".git") {
+        repo.removeLast(4)
+    }
+    return safeGitHubRepo(repo) ? repo : nil
 }
 
 public struct RemoteAuthorityCLIProfileDescriptor: Codable, Equatable, Sendable {
@@ -3359,6 +3718,13 @@ public struct ShellBypassGuard: Sendable {
         commandName: String,
         args: [String]
     ) async -> ShellGuardResult {
+        if mutation.kind == "github.pr.merge" {
+            return ShellGuardResult(
+                allowed: false,
+                message: "Blocked direct PR merge `\(commandName) \(redactedArguments(args).joined(separator: " "))`: use Aegis Broker MCP `run_remote_action` with `github.pr.merge` so Broker can derive and enforce `git config user.email`."
+            )
+        }
+
         guard let brunoEvaluator else {
             return ShellGuardResult(allowed: true)
         }

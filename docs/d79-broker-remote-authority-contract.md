@@ -57,6 +57,20 @@ Example action ids:
 Typed actions execute in Broker or a Broker-launched approved job identity, not
 in the protected worker process tree.
 
+`github.pr.merge` is special because GitHub-created merge commits need an
+author email. The action must not accept an agent-supplied `author_email`.
+Instead, the payload includes `cwd`, Broker reads the effective
+`git config user.email` from that checkout, validates the email against the
+repository owner policy, and performs the merge through GitHub GraphQL
+`MergePullRequestInput.authorEmail`. If the checkout has no effective
+`user.email`, Broker fails closed and tells the agent to set Git config for the
+checkout before retrying. Broker does not mutate Git config or write identity
+state.
+
+Direct `gh pr merge` in protected mode is denied and rerouted to the
+`github.pr.merge` typed action so this identity check cannot be bypassed by a
+plain CLI call.
+
 ## CLI Profiles
 
 CLI profiles are for existing tools where native reimplementation would create
