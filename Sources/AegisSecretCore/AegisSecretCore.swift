@@ -3084,6 +3084,21 @@ public struct ShellGuardResult: Equatable, Sendable {
     }
 }
 
+public func codexPreToolUseDenyHookOutput(reason: String) throws -> String {
+    let payload: [String: Any] = [
+        "hookSpecificOutput": [
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        ]
+    ]
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    guard let output = String(data: data, encoding: .utf8) else {
+        throw AegisSecretError.runtime("Failed to encode Codex PreToolUse deny output.")
+    }
+    return output
+}
+
 public struct ShellGuardWrappedCommand: Equatable, Sendable {
     public let name: String
     public let denyPrefixes: [[String]]
@@ -4573,15 +4588,43 @@ public struct CLIApplication {
     private func handleGuard(_ command: GuardCommand) async throws {
         switch command {
         case .shell(let explicitCommand):
-            let commandText = try explicitCommand ?? extractShellCommand(from: FileHandle.standardInput.readDataToEndOfFile())
-            let guardResult = await ShellBypassGuard(resolvedCommands: try commandStore.resolvedCommands())
-                .evaluate(command: commandText)
+            let hookMode = explicitCommand == nil
+            let commandText: String
+            do {
+                commandText = try explicitCommand ?? extractShellCommand(from: FileHandle.standardInput.readDataToEndOfFile())
+            } catch {
+                print(try codexPreToolUseDenyHookOutput(reason: codexBrokerRetryReason(
+                    "Aegis Secret could not parse the shell command from Codex hook input."
+                )))
+                return
+            }
+            let resolvedCommands: [ResolvedWrappedCommand]
+            do {
+                resolvedCommands = try commandStore.resolvedCommands()
+            } catch {
+                if hookMode {
+                    print(try codexPreToolUseDenyHookOutput(reason: codexBrokerRetryReason(
+                        "Aegis Secret could not load the wrapped-command policy."
+                    )))
+                    return
+                }
+                throw error
+            }
+            let guardResult = await ShellBypassGuard(resolvedCommands: resolvedCommands).evaluate(command: commandText)
             if guardResult.allowed {
                 return
             }
 
+            if hookMode {
+                print(try codexPreToolUseDenyHookOutput(reason: guardResult.message))
+                return
+            }
             throw AegisSecretError.blocked(guardResult.message)
         }
+    }
+
+    private func codexBrokerRetryReason(_ prefix: String) -> String {
+        "\(prefix) Retry through Aegis Broker MCP `list_commands` and `run_command` if this was a privileged action."
     }
 
     private func extractShellCommand(from data: Data) throws -> String {
