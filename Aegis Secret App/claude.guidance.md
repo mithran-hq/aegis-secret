@@ -3,6 +3,8 @@
 Use ordinary shell calls for ordinary commands. Use Aegis Broker only for protected or privileged actions.
 
 - Protected GitHub method mutations such as issue close, PR merge, or release edits are checked by the Aegis PreTool hook and Bruno before the original command runs.
+- Protected GitHub/source-control mutations can use typed Broker MCP actions: call `list_remote_actions`, then `run_remote_action`.
+- Approved cloud/deploy/package mutations can use fixed Broker CLI profiles: call `list_cli_profiles`, then `run_cli_profile`.
 - Privileged credentialed actions such as `terraform apply` must use the Aegis Broker MCP server: call `list_commands`, then `run_command`.
 - Ordinary commands such as `gh issue list`, `terraform plan`, and `git status` are not brokered by default.
 - Use `aegis-secret command list` and `aegis-secret command show <NAME>` only as a local fallback when MCP is unavailable.

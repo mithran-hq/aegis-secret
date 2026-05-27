@@ -138,10 +138,15 @@ private struct ListRemoteActionsToolResponse: Encodable {
     let actions: [RemoteAuthorityActionDescriptor]
 }
 
+private struct ListCLIProfilesToolResponse: Encodable {
+    let profiles: [RemoteAuthorityCLIProfileDescriptor]
+}
+
 public final class StdioMCPServer {
     private let commandStore: CommandStore
     private let runner: WrappedCommandRunner
     private let remoteActionRunner: RemoteAuthorityActionRunner
+    private let cliProfileRunner: RemoteAuthorityCLIProfileRunner
     private let agentName: String?
     private let receiptRecorder: ToolDecisionReceiptRecorder
 
@@ -149,6 +154,7 @@ public final class StdioMCPServer {
         commandStore: CommandStore = CommandStore(),
         runner: WrappedCommandRunner? = nil,
         remoteActionRunner: RemoteAuthorityActionRunner? = nil,
+        cliProfileRunner: RemoteAuthorityCLIProfileRunner? = nil,
         agentName: String? = ProcessInfo.processInfo.environment["AEGIS_SECRET_AGENT_NAME"],
         receiptRecorder: ToolDecisionReceiptRecorder = ToolDecisionReceiptRecorder()
     ) {
@@ -157,6 +163,10 @@ public final class StdioMCPServer {
         self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore, secretStore: secretStore)
         self.remoteActionRunner = remoteActionRunner ?? RemoteAuthorityActionRunner(
             leaseProvider: SecretStoreRemoteAuthorityLeaseProvider(secretStore: secretStore)
+        )
+        self.cliProfileRunner = cliProfileRunner ?? RemoteAuthorityCLIProfileRunner(
+            leaseProvider: SecretStoreCLIProfileLeaseProvider(secretStore: secretStore),
+            commandStore: commandStore
         )
         self.agentName = agentName
         self.receiptRecorder = receiptRecorder
@@ -261,6 +271,40 @@ public final class StdioMCPServer {
                     actionID: actionID,
                     payload: payload,
                     requester: requester
+                ))
+                try emitToolResult(id: id, payload: result)
+            case "list_cli_profiles":
+                try emitToolResult(id: id, payload: ListCLIProfilesToolResponse(profiles: cliProfileRunner.listProfiles()))
+            case "run_cli_profile":
+                guard let profileID = arguments["profile_id"]?.stringValue else {
+                    try emitToolError(id: id, message: "Missing `profile_id`.")
+                    return
+                }
+                let parameters = try decodeStringMap(arguments["parameters"], label: "parameters")
+                guard let authLeaseRef = arguments["auth_lease_ref"]?.stringValue else {
+                    try emitToolError(id: id, message: "Missing `auth_lease_ref`.")
+                    return
+                }
+                guard let grantRef = arguments["grant_ref"]?.stringValue else {
+                    try emitToolError(id: id, message: "Missing `grant_ref`.")
+                    return
+                }
+                guard let credentialRef = arguments["credential_ref"]?.stringValue else {
+                    try emitToolError(id: id, message: "Missing `credential_ref`.")
+                    return
+                }
+                let requester = arguments["requester"]?.stringValue ?? agentName ?? "MCP client"
+                let result = try await cliProfileRunner.run(RemoteAuthorityCLIProfileRequest(
+                    profileID: profileID,
+                    parameters: parameters,
+                    cwd: arguments["cwd"]?.stringValue,
+                    authLeaseRef: authLeaseRef,
+                    grantRef: grantRef,
+                    credentialRef: credentialRef,
+                    requester: requester,
+                    projectRef: arguments["project_ref"]?.stringValue,
+                    resourceScopeRef: arguments["resource_scope_ref"]?.stringValue,
+                    sessionRef: arguments["session_ref"]?.stringValue
                 ))
                 try emitToolResult(id: id, payload: result)
             case "run_command":
@@ -394,6 +438,81 @@ public final class StdioMCPServer {
                 ]
             ),
             ToolDescriptor(
+                name: "list_cli_profiles",
+                title: "List brokered CLI profiles",
+                description: "List approved Broker CLI profiles for remote authenticated mutations that must run through fixed argv templates with scoped credential materialization.",
+                inputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                ],
+                outputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "profiles": .object([
+                            "type": .string("array")
+                        ])
+                    ]),
+                ]
+            ),
+            ToolDescriptor(
+                name: "run_cli_profile",
+                title: "Run brokered CLI profile",
+                description: "Run an approved Broker CLI profile with fixed argv rendering, cwd constraints, scoped credential injection, Bruno gating when required, and metadata-only output evidence.",
+                inputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "profile_id": .object([
+                            "type": .string("string"),
+                            "description": .string("Approved profile id, such as gcloud.run.deploy.sandbox.")
+                        ]),
+                        "parameters": .object([
+                            "type": .string("object"),
+                            "description": .string("String parameters consumed by the profile argv template.")
+                        ]),
+                        "cwd": .object([
+                            "type": .string("string"),
+                            "description": .string("Optional absolute working directory constrained by the profile.")
+                        ]),
+                        "auth_lease_ref": .object([
+                            "type": .string("string"),
+                            "description": .string("Scoped auth lease ref issued by MAP/Broker.")
+                        ]),
+                        "grant_ref": .object([
+                            "type": .string("string"),
+                            "description": .string("Grant ref bound to the remote mutation profile.")
+                        ]),
+                        "credential_ref": .object([
+                            "type": .string("string"),
+                            "description": .string("Broker-local credential ref. Raw credential values are forbidden.")
+                        ]),
+                        "requester": .object([
+                            "type": .string("string"),
+                            "description": .string("Optional caller label recorded in evidence.")
+                        ]),
+                        "project_ref": .object(["type": .string("string")]),
+                        "resource_scope_ref": .object(["type": .string("string")]),
+                        "session_ref": .object(["type": .string("string")]),
+                    ]),
+                    "required": .array([
+                        .string("profile_id"),
+                        .string("parameters"),
+                        .string("cwd"),
+                        .string("auth_lease_ref"),
+                        .string("grant_ref"),
+                        .string("credential_ref"),
+                    ]),
+                ],
+                outputSchema: [
+                    "type": .string("object"),
+                    "properties": .object([
+                        "status": .object(["type": .string("string")]),
+                        "profile_id": .object(["type": .string("string")]),
+                        "exit_code": .object(["type": .string("integer")]),
+                        "evidence": .object(["description": .string("D79 CLI-profile evidence with metadata-only output redaction.")]),
+                    ]),
+                ]
+            ),
+            ToolDescriptor(
                 name: "run_command",
                 title: "Run brokered command",
                 description: "Run a configured command through Aegis Broker with Touch ID approval and redacted output. Use this for privileged credentialed actions when the PreTool hook requires brokered execution; ordinary commands should use the normal tool path.",
@@ -436,6 +555,21 @@ public final class StdioMCPServer {
                 ]
             ),
         ]
+    }
+
+    private func decodeStringMap(_ value: JSONValue?, label: String) throws -> [String: String] {
+        guard let object = value?.objectValue else {
+            throw AegisSecretError.runtime("`\(label)` must be an object of strings.")
+        }
+
+        var result: [String: String] = [:]
+        for (key, item) in object {
+            guard let value = item.stringValue else {
+                throw AegisSecretError.runtime("`\(label).\(key)` must be a string.")
+            }
+            result[key] = value
+        }
+        return result
     }
 
     private func decodeArgs(_ value: JSONValue?) throws -> [String] {

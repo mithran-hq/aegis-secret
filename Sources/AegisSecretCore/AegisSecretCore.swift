@@ -2294,6 +2294,512 @@ private func githubOperation(actionID: String, repo: String, payload: [String: J
     }
 }
 
+public struct RemoteAuthorityCLIProfileDescriptor: Codable, Equatable, Sendable {
+    public let schemaVersion: String
+    public let profileID: String
+    public let tool: String
+    public let argvTemplate: [String]
+    public let argvTemplateDigest: String
+    public let allowedCWDPrefixes: [String]
+    public let grantClass: String
+    public let credentialClass: String
+    public let credentialEnvironmentVariable: String
+    public let networkPolicyRef: String
+    public let approvalRequirement: String
+    public let timeoutSeconds: Int
+    public let maxOutputBytes: Int
+    public let outputRedaction: String
+    public let cleanup: String
+    public let brunoGateRef: String
+
+    public init(
+        schemaVersion: String = "aegis.broker.cli_profile.v1",
+        profileID: String,
+        tool: String,
+        argvTemplate: [String],
+        allowedCWDPrefixes: [String],
+        grantClass: String,
+        credentialClass: String,
+        credentialEnvironmentVariable: String,
+        networkPolicyRef: String,
+        approvalRequirement: String = "none",
+        timeoutSeconds: Int = 120,
+        maxOutputBytes: Int = 64 * 1024,
+        outputRedaction: String = "metadata_only_sha256",
+        cleanup: String = "drop_env_credentials_after_process_exit",
+        brunoGateRef: String = "none"
+    ) {
+        self.schemaVersion = schemaVersion
+        self.profileID = profileID
+        self.tool = tool
+        self.argvTemplate = argvTemplate
+        self.argvTemplateDigest = "sha256:\(sha256Hex(Data(argvTemplate.joined(separator: "\u{1F}").utf8)))"
+        self.allowedCWDPrefixes = allowedCWDPrefixes
+        self.grantClass = grantClass
+        self.credentialClass = credentialClass
+        self.credentialEnvironmentVariable = credentialEnvironmentVariable
+        self.networkPolicyRef = networkPolicyRef
+        self.approvalRequirement = approvalRequirement
+        self.timeoutSeconds = timeoutSeconds
+        self.maxOutputBytes = maxOutputBytes
+        self.outputRedaction = outputRedaction
+        self.cleanup = cleanup
+        self.brunoGateRef = brunoGateRef
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case profileID = "profile_id"
+        case tool
+        case argvTemplate = "argv_template"
+        case argvTemplateDigest = "argv_template_digest"
+        case allowedCWDPrefixes = "allowed_cwd_prefixes"
+        case grantClass = "grant_class"
+        case credentialClass = "credential_class"
+        case credentialEnvironmentVariable = "credential_environment_variable"
+        case networkPolicyRef = "network_policy_ref"
+        case approvalRequirement = "approval_requirement"
+        case timeoutSeconds = "timeout_seconds"
+        case maxOutputBytes = "max_output_bytes"
+        case outputRedaction = "output_redaction"
+        case cleanup
+        case brunoGateRef = "bruno_gate_ref"
+    }
+}
+
+public struct RemoteAuthorityCLIProfileCatalog: Sendable {
+    public let profiles: [RemoteAuthorityCLIProfileDescriptor]
+
+    public init(profiles: [RemoteAuthorityCLIProfileDescriptor] = RemoteAuthorityCLIProfileCatalog.defaultProfiles()) {
+        self.profiles = profiles.sorted { $0.profileID < $1.profileID }
+    }
+
+    public func descriptor(profileID: String) throws -> RemoteAuthorityCLIProfileDescriptor {
+        guard let descriptor = profiles.first(where: { $0.profileID == profileID }) else {
+            throw AegisSecretError.blocked("broker_cli_profile_unsupported: CLI profile `\(profileID)` is not supported.")
+        }
+        return descriptor
+    }
+
+    public static func defaultProfiles() -> [RemoteAuthorityCLIProfileDescriptor] {
+        [
+            RemoteAuthorityCLIProfileDescriptor(
+                profileID: "gcloud.run.deploy.sandbox",
+                tool: "gcloud",
+                argvTemplate: [
+                    "run", "deploy", "{{service}}",
+                    "--image", "{{image}}",
+                    "--region", "{{region}}",
+                    "--project", "{{project}}",
+                    "--quiet",
+                ],
+                allowedCWDPrefixes: ["/workspace"],
+                grantClass: "cloud_deploy_mutation",
+                credentialClass: "gcp_access_token",
+                credentialEnvironmentVariable: "CLOUDSDK_AUTH_ACCESS_TOKEN",
+                networkPolicyRef: "network-policy://d79/gcloud-run-deploy",
+                brunoGateRef: "bruno://gcloud.run.deploy.v1"
+            )
+        ]
+    }
+}
+
+public struct RemoteAuthorityCLIProfileRequest: Codable, Equatable, Sendable {
+    public let profileID: String
+    public let parameters: [String: String]
+    public let cwd: String?
+    public let authLeaseRef: String
+    public let grantRef: String
+    public let credentialRef: String
+    public let requester: String?
+    public let projectRef: String?
+    public let resourceScopeRef: String?
+    public let sessionRef: String?
+
+    public init(
+        profileID: String,
+        parameters: [String: String],
+        cwd: String?,
+        authLeaseRef: String,
+        grantRef: String,
+        credentialRef: String,
+        requester: String? = nil,
+        projectRef: String? = nil,
+        resourceScopeRef: String? = nil,
+        sessionRef: String? = nil
+    ) {
+        self.profileID = profileID
+        self.parameters = parameters
+        self.cwd = cwd
+        self.authLeaseRef = authLeaseRef
+        self.grantRef = grantRef
+        self.credentialRef = credentialRef
+        self.requester = requester
+        self.projectRef = projectRef
+        self.resourceScopeRef = resourceScopeRef
+        self.sessionRef = sessionRef
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case profileID = "profile_id"
+        case parameters
+        case cwd
+        case authLeaseRef = "auth_lease_ref"
+        case grantRef = "grant_ref"
+        case credentialRef = "credential_ref"
+        case requester
+        case projectRef = "project_ref"
+        case resourceScopeRef = "resource_scope_ref"
+        case sessionRef = "session_ref"
+    }
+}
+
+public protocol RemoteAuthorityCLIProfileLeaseProviding: Sendable {
+    func lease(for request: RemoteAuthorityCLIProfileRequest, profile: RemoteAuthorityCLIProfileDescriptor) async throws -> RemoteAuthorityLease
+}
+
+public struct SecretStoreCLIProfileLeaseProvider: RemoteAuthorityCLIProfileLeaseProviding {
+    public let secretStore: any SecretStore
+
+    public init(secretStore: any SecretStore) {
+        self.secretStore = secretStore
+    }
+
+    public func lease(for request: RemoteAuthorityCLIProfileRequest, profile: RemoteAuthorityCLIProfileDescriptor) async throws -> RemoteAuthorityLease {
+        guard safeAuthorityRef(request.authLeaseRef, prefixes: ["auth-lease://"]) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: auth lease ref is unsafe.")
+        }
+        guard safeAuthorityRef(request.grantRef, prefixes: ["auth-grant://", "grant://"]) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: grant ref is unsafe.")
+        }
+        guard let secretKey = secretReferenceKey(from: request.credentialRef) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: credential ref must be broker-local.")
+        }
+        let reason = "Allow Aegis Broker to materialize \(profile.credentialClass) for CLI profile '\(profile.profileID)'."
+        let tokenData: Data
+        do {
+            tokenData = try secretStore.readSecret(for: secretKey, reason: reason)
+        } catch {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
+        }
+        guard let token = String(data: tokenData, encoding: .utf8)?.trimmedNonEmpty else {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
+        }
+        return RemoteAuthorityLease(authLeaseRef: request.authLeaseRef, grantRef: request.grantRef, token: token)
+    }
+}
+
+public struct RemoteAuthorityCLIProfileEvidence: Codable, Equatable, Sendable {
+    public let schemaVersion: String
+    public let evidenceID: String
+    public let profileID: String
+    public let caller: [String: String]
+    public let projectRef: String
+    public let resourceScopeRef: String
+    public let grantClass: String
+    public let credentialClass: String
+    public let authLeaseRef: String
+    public let grantRef: String
+    public let argvTemplate: [String]
+    public let argvTemplateDigest: String
+    public let commandDigest: String
+    public let brunoDecisionRef: String
+    public let approvalRef: String
+    public let executionMode: String
+    public let startedAt: String
+    public let completedAt: String
+    public let result: String
+    public let cleanupStatus: String
+    public let redactionState: String
+    public let rawCredentialMaterialPrinted: Bool
+    public let output: ToolDecisionOutputMetadata
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case evidenceID = "evidence_id"
+        case profileID = "profile_id"
+        case caller
+        case projectRef = "project_ref"
+        case resourceScopeRef = "resource_scope_ref"
+        case grantClass = "grant_class"
+        case credentialClass = "credential_class"
+        case authLeaseRef = "auth_lease_ref"
+        case grantRef = "grant_ref"
+        case argvTemplate = "argv_template"
+        case argvTemplateDigest = "argv_template_digest"
+        case commandDigest = "command_digest"
+        case brunoDecisionRef = "bruno_decision_ref"
+        case approvalRef = "approval_ref"
+        case executionMode = "execution_mode"
+        case startedAt = "started_at"
+        case completedAt = "completed_at"
+        case result
+        case cleanupStatus = "cleanup_status"
+        case redactionState = "redaction_state"
+        case rawCredentialMaterialPrinted = "raw_credential_material_printed"
+        case output
+    }
+}
+
+public struct RemoteAuthorityCLIProfileInvocationResult: Codable, Equatable, Sendable {
+    public let status: String
+    public let profileID: String
+    public let exitCode: Int32
+    public let evidence: RemoteAuthorityCLIProfileEvidence
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case profileID = "profile_id"
+        case exitCode = "exit_code"
+        case evidence
+    }
+}
+
+public struct RemoteAuthorityCLIProfileRunner: Sendable {
+    public let catalog: RemoteAuthorityCLIProfileCatalog
+    public let leaseProvider: any RemoteAuthorityCLIProfileLeaseProviding
+    public let commandStore: CommandStore
+    public let executor: CommandExecutor
+    public let environment: [String: String]
+    public let brunoEvaluator: (any BrunoGuardEvaluating)?
+    public let now: @Sendable () -> Date
+
+    public init(
+        catalog: RemoteAuthorityCLIProfileCatalog = RemoteAuthorityCLIProfileCatalog(),
+        leaseProvider: any RemoteAuthorityCLIProfileLeaseProviding,
+        commandStore: CommandStore = CommandStore(),
+        executor: CommandExecutor = ProcessCommandExecutor(),
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        brunoEvaluator: (any BrunoGuardEvaluating)? = ProcessBrunoGuardEvaluator(),
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
+        self.catalog = catalog
+        self.leaseProvider = leaseProvider
+        self.commandStore = commandStore
+        self.executor = executor
+        self.environment = environment
+        self.brunoEvaluator = brunoEvaluator
+        self.now = now
+    }
+
+    public func listProfiles() -> [RemoteAuthorityCLIProfileDescriptor] {
+        catalog.profiles
+    }
+
+    public func run(_ request: RemoteAuthorityCLIProfileRequest) async throws -> RemoteAuthorityCLIProfileInvocationResult {
+        let profile = try catalog.descriptor(profileID: request.profileID)
+        let startedAt = now()
+        let argv = try renderArgvTemplate(profile.argvTemplate, parameters: request.parameters)
+        let cwd = try resolveProfileCWD(request.cwd, allowedPrefixes: profile.allowedCWDPrefixes)
+        let brunoDecisionRef = try await evaluateCLIProfileBrunoIfNeeded(profile: profile, request: request, argv: argv)
+        let lease = try await leaseProvider.lease(for: request, profile: profile)
+        guard let executableURL = commandStore.resolveExecutable(named: profile.tool) else {
+            throw AegisSecretError.blocked("broker_cli_profile_unsupported: tool `\(profile.tool)` is not executable on PATH.")
+        }
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aegis-cli-profile-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        var executionEnvironment = isolatedCLIProfileEnvironment(from: environment, tempRoot: tempRoot)
+        executionEnvironment[profile.credentialEnvironmentVariable] = lease.token
+        let rawResult: RawCommandExecutionResult
+        do {
+            rawResult = try await executor.execute(CommandExecutionRequest(
+                executableURL: executableURL,
+                arguments: argv,
+                environment: executionEnvironment,
+                currentDirectoryURL: cwd,
+                timeoutSeconds: profile.timeoutSeconds,
+                maxOutputBytes: profile.maxOutputBytes
+            ))
+        } catch {
+            _ = cleanupCLIProfileTempRoot(tempRoot)
+            throw error
+        }
+        let credentialMaterialPrinted = containsCredentialMaterial(rawResult, token: lease.token)
+        let cleanupStatus = cleanupCLIProfileTempRoot(tempRoot)
+        let evidence = RemoteAuthorityCLIProfileEvidence(
+            schemaVersion: "aegis.broker.remote_authority_evidence.v1",
+            evidenceID: "broker-evidence://\(request.profileID)/\(sha256Hex(Data("\(argv.joined(separator: "\u{1F}")):\(startedAt.timeIntervalSince1970)".utf8)))",
+            profileID: request.profileID,
+            caller: [
+                "agent": request.requester?.trimmedNonEmpty ?? "local-agent",
+                "session_ref": request.sessionRef?.trimmedNonEmpty ?? "agent-session://local",
+            ],
+            projectRef: request.projectRef?.trimmedNonEmpty ?? "project://local",
+            resourceScopeRef: request.resourceScopeRef?.trimmedNonEmpty ?? "resource://local/cli-profile",
+            grantClass: profile.grantClass,
+            credentialClass: profile.credentialClass,
+            authLeaseRef: lease.authLeaseRef,
+            grantRef: lease.grantRef,
+            argvTemplate: redactedArgvTemplate(profile.argvTemplate),
+            argvTemplateDigest: profile.argvTemplateDigest,
+            commandDigest: "sha256:\(sha256Hex(Data(([executableURL.path] + argv).joined(separator: "\u{1F}").utf8)))",
+            brunoDecisionRef: brunoDecisionRef,
+            approvalRef: profile.approvalRequirement == "none" ? "none" : "approval://local/required",
+            executionMode: "broker_job",
+            startedAt: iso8601String(startedAt),
+            completedAt: iso8601String(now()),
+            result: rawResult.exitCode == 0 ? "allowed" : "failed",
+            cleanupStatus: cleanupStatus,
+            redactionState: credentialMaterialPrinted ? "credential_material_observed_metadata_only" : profile.outputRedaction,
+            rawCredentialMaterialPrinted: credentialMaterialPrinted,
+            output: ToolDecisionOutputMetadata(stdout: rawResult.stdout, stderr: rawResult.stderr)
+        )
+        return RemoteAuthorityCLIProfileInvocationResult(
+            status: rawResult.exitCode == 0 ? "ok" : "failed",
+            profileID: request.profileID,
+            exitCode: rawResult.exitCode,
+            evidence: evidence
+        )
+    }
+
+    private func evaluateCLIProfileBrunoIfNeeded(
+        profile: RemoteAuthorityCLIProfileDescriptor,
+        request: RemoteAuthorityCLIProfileRequest,
+        argv: [String]
+    ) async throws -> String {
+        guard profile.brunoGateRef != "none" else {
+            return "none"
+        }
+        guard let brunoEvaluator else {
+            throw AegisSecretError.blocked("broker_bruno_denied: Bruno guard is required but unavailable.")
+        }
+        let decision = try await brunoEvaluator.evaluate(event: .object([
+            "schema_version": .string("aegis.broker.bruno_event.v1"),
+            "action": .object([
+                "kind": .string("broker.cli_profile.run"),
+                "profile_id": .string(profile.profileID),
+                "tool": .string(profile.tool),
+                "argv_template": .array(redactedArgvTemplate(profile.argvTemplate).map { .string($0) }),
+                "argv": .array(argv.map { .string(redactSensitiveCLIArgument($0)) }),
+                "bruno_gate_ref": .string(profile.brunoGateRef),
+            ]),
+            "actor": .object([
+                "agent": .string(request.requester?.trimmedNonEmpty ?? "local-agent"),
+                "session_ref": .string(request.sessionRef?.trimmedNonEmpty ?? "agent-session://local"),
+            ]),
+            "context": .object([
+                "tool_kind": .string("broker_cli_profile"),
+                "cwd": .string("[REDACTED_PATH]"),
+            ]),
+            "redaction_state": .string("metadata_only"),
+        ]))
+        guard decision.decision == "allow" else {
+            throw AegisSecretError.blocked("broker_bruno_denied: \(decision.recommendedNextPrompt ?? decision.reasons.first?.message ?? "Bruno denied the CLI profile.").")
+        }
+        return "bruno-decision://\(profile.profileID)/\(sha256Hex(Data(argv.joined(separator: "\u{1F}").utf8)))"
+    }
+}
+
+private func renderArgvTemplate(_ template: [String], parameters: [String: String]) throws -> [String] {
+    let expectedKeys = Set(template.compactMap(templateParameterKey))
+    let unexpectedKeys = Set(parameters.keys).subtracting(expectedKeys)
+    guard unexpectedKeys.isEmpty else {
+        throw AegisSecretError.blocked("broker_policy_denied: unsupported CLI profile parameter `\(unexpectedKeys.sorted()[0])`.")
+    }
+
+    return try template.map { item in
+        guard let key = templateParameterKey(item) else {
+            return item
+        }
+        guard let value = parameters[key]?.trimmedNonEmpty else {
+            throw AegisSecretError.blocked("broker_policy_denied: missing CLI profile parameter `\(key)`.")
+        }
+        guard safeCLIParameter(value) else {
+            throw AegisSecretError.blocked("broker_policy_denied: unsafe CLI profile parameter `\(key)`.")
+        }
+        return value
+    }
+}
+
+private func templateParameterKey(_ item: String) -> String? {
+    guard item.hasPrefix("{{"), item.hasSuffix("}}") else {
+        return nil
+    }
+    return String(item.dropFirst(2).dropLast(2))
+}
+
+private func safeCLIParameter(_ value: String) -> Bool {
+    value.count <= 512 &&
+    !value.contains(where: \.isNewline) &&
+    !value.contains("\u{0}") &&
+    value.unicodeScalars.allSatisfy(isSafeCLIParameterScalar) &&
+    redactionSafe(value)
+}
+
+private func isSafeCLIParameterScalar(_ scalar: UnicodeScalar) -> Bool {
+    switch scalar.value {
+    case 48...57, 65...90, 97...122:
+        return true
+    default:
+        return "._:/+=,-".unicodeScalars.contains(scalar)
+    }
+}
+
+private func resolveProfileCWD(_ cwd: String?, allowedPrefixes: [String]) throws -> URL? {
+    guard let cwd = cwd?.trimmedNonEmpty else {
+        throw AegisSecretError.blocked("broker_policy_denied: CLI profile cwd is required.")
+    }
+    guard cwd.hasPrefix("/") else {
+        throw AegisSecretError.blocked("broker_policy_denied: CLI profile cwd must be absolute.")
+    }
+    guard !cwd.contains("\u{0}"), !cwd.contains(where: \.isNewline) else {
+        throw AegisSecretError.blocked("broker_policy_denied: CLI profile cwd is unsafe.")
+    }
+    let resolvedCWD = URL(fileURLWithPath: cwd, isDirectory: true).standardizedFileURL.path
+    let resolvedPrefixes = allowedPrefixes.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+    guard resolvedPrefixes.contains(where: { resolvedCWD == $0 || resolvedCWD.hasPrefix($0 + "/") }) else {
+        throw AegisSecretError.blocked("broker_policy_denied: CLI profile cwd is outside allowed workspace roots.")
+    }
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: resolvedCWD, isDirectory: &isDirectory), isDirectory.boolValue else {
+        throw AegisSecretError.blocked("broker_policy_denied: CLI profile cwd does not exist.")
+    }
+    return URL(fileURLWithPath: resolvedCWD, isDirectory: true)
+}
+
+private func redactedArgvTemplate(_ template: [String]) -> [String] {
+    template.map { item in
+        if item.hasPrefix("{{"), item.hasSuffix("}}") {
+            return "[PARAM]"
+        }
+        return item
+    }
+}
+
+private func redactSensitiveCLIArgument(_ value: String) -> String {
+    redactionSafe(value) ? value : "[REDACTED]"
+}
+
+private func isolatedCLIProfileEnvironment(from environment: [String: String], tempRoot: URL) -> [String: String] {
+    var isolated: [String: String] = [:]
+    for key in ["PATH", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NO_COLOR"] {
+        if let value = environment[key]?.trimmedNonEmpty {
+            isolated[key] = value
+        }
+    }
+    isolated["HOME"] = tempRoot.path
+    isolated["XDG_CONFIG_HOME"] = tempRoot.appendingPathComponent("xdg-config", isDirectory: true).path
+    isolated["CLOUDSDK_CONFIG"] = tempRoot.appendingPathComponent("gcloud", isDirectory: true).path
+    return isolated
+}
+
+private func cleanupCLIProfileTempRoot(_ tempRoot: URL) -> String {
+    do {
+        try FileManager.default.removeItem(at: tempRoot)
+        return "credentials_dropped"
+    } catch {
+        return "credential_env_dropped_temp_cleanup_failed"
+    }
+}
+
+private func containsCredentialMaterial(_ result: RawCommandExecutionResult, token: String) -> Bool {
+    guard let tokenData = token.data(using: .utf8), !tokenData.isEmpty else {
+        return false
+    }
+    return result.stdout.range(of: tokenData) != nil || result.stderr.range(of: tokenData) != nil
+}
+
 public struct WrappedCommandRunner: Sendable {
     public let commandStore: CommandStore
     public let authenticator: DeviceAuthenticator
@@ -4643,6 +5149,7 @@ Use ordinary shell calls for ordinary commands. Use Aegis Broker only for protec
 
 - Protected GitHub method mutations such as issue close, PR merge, or release edits are checked by the Aegis PreTool hook and Bruno before the original command runs.
 - Protected GitHub/source-control mutations can use typed Broker MCP actions: call `list_remote_actions`, then `run_remote_action`.
+- Approved cloud/deploy/package mutations can use fixed Broker CLI profiles: call `list_cli_profiles`, then `run_cli_profile`.
 - Privileged credentialed actions such as `terraform apply` must use the Aegis Broker MCP server: call `list_commands`, then `run_command`.
 - Ordinary commands such as `gh issue list`, `terraform plan`, and `git status` are not brokered by default.
 - Use `aegis-secret command list` and `aegis-secret command show <NAME>` only as a local fallback when MCP is unavailable.
@@ -4659,6 +5166,7 @@ Use ordinary shell calls for ordinary commands. Use Aegis Broker only for protec
 
 - Protected GitHub method mutations such as issue close, PR merge, or release edits are checked by the Aegis PreTool hook and Bruno before the original command runs.
 - Protected GitHub/source-control mutations can use typed Broker MCP actions: call `list_remote_actions`, then `run_remote_action`.
+- Approved cloud/deploy/package mutations can use fixed Broker CLI profiles: call `list_cli_profiles`, then `run_cli_profile`.
 - Privileged credentialed actions such as `terraform apply` must use the Aegis Broker MCP server: call `list_commands`, then `run_command`.
 - Ordinary commands such as `gh issue list`, `terraform plan`, and `git status` are not brokered by default.
 - Use `aegis-secret command list` and `aegis-secret command show <NAME>` only as a local fallback when MCP is unavailable.

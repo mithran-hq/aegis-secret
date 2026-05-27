@@ -75,6 +75,14 @@ struct StubGitHubRemoteAuthorityClient: GitHubRemoteAuthorityClient {
     }
 }
 
+struct StubCLIProfileLeaseProvider: RemoteAuthorityCLIProfileLeaseProviding {
+    let handler: @Sendable (RemoteAuthorityCLIProfileRequest, RemoteAuthorityCLIProfileDescriptor) async throws -> RemoteAuthorityLease
+
+    func lease(for request: RemoteAuthorityCLIProfileRequest, profile: RemoteAuthorityCLIProfileDescriptor) async throws -> RemoteAuthorityLease {
+        try await handler(request, profile)
+    }
+}
+
 final class AegisSecretCoreTests: XCTestCase {
     func testHelpWhenNoArguments() throws {
         XCTAssertEqual(try CommandParser().parse([], stdinIsTTY: true), .help)
@@ -718,6 +726,224 @@ final class AegisSecretCoreTests: XCTestCase {
             XCTFail("expected unsupported action failure")
         } catch let error as AegisSecretError {
             XCTAssertTrue(error.description.contains("broker_action_unsupported"))
+        }
+    }
+
+    func testCLIProfileGCloudRunDeploySucceedsWithScopedLeaseAndEvidence() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executableURL = try makeExecutable(named: "gcloud", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let profile = RemoteAuthorityCLIProfileDescriptor(
+            profileID: "gcloud.run.deploy.sandbox",
+            tool: "gcloud",
+            argvTemplate: [
+                "run", "deploy", "{{service}}",
+                "--image", "{{image}}",
+                "--region", "{{region}}",
+                "--project", "{{project}}",
+                "--quiet",
+            ],
+            allowedCWDPrefixes: [tempDirectory.path],
+            grantClass: "cloud_deploy_mutation",
+            credentialClass: "gcp_access_token",
+            credentialEnvironmentVariable: "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            networkPolicyRef: "network-policy://d79/gcloud-run-deploy",
+            brunoGateRef: "bruno://gcloud.run.deploy.v1"
+        )
+        let runner = RemoteAuthorityCLIProfileRunner(
+            catalog: RemoteAuthorityCLIProfileCatalog(profiles: [profile]),
+            leaseProvider: StubCLIProfileLeaseProvider { request, descriptor in
+                XCTAssertEqual(request.profileID, "gcloud.run.deploy.sandbox")
+                XCTAssertEqual(request.credentialRef, "\(secretEnvironmentReferencePrefix)gcp-run-token")
+                XCTAssertEqual(descriptor.grantClass, "cloud_deploy_mutation")
+                return RemoteAuthorityLease(
+                    authLeaseRef: "auth-lease://gcp/run/deploy",
+                    grantRef: "auth-grant://cloud_deploy_mutation/sandbox",
+                    token: "secret-token-123"
+                )
+            },
+            commandStore: CommandStore(
+                fileURL: tempDirectory.appendingPathComponent("commands.json"),
+                environment: ["PATH": tempDirectory.path]
+            ),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.executableURL.path, executableURL.path)
+                XCTAssertEqual(request.currentDirectoryURL?.path, tempDirectory.path)
+                XCTAssertEqual(request.environment["CLOUDSDK_AUTH_ACCESS_TOKEN"], "secret-token-123")
+                XCTAssertNil(request.environment["UNRELATED_SECRET"])
+                XCTAssertTrue(request.environment["HOME"]?.contains("aegis-cli-profile-") == true)
+                XCTAssertTrue(request.environment["CLOUDSDK_CONFIG"]?.contains("aegis-cli-profile-") == true)
+                XCTAssertEqual(request.arguments, [
+                    "run", "deploy", "aegis-smoke",
+                    "--image", "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                    "--region", "us-central1",
+                    "--project", "mithran-sandbox",
+                    "--quiet",
+                ])
+                return RawCommandExecutionResult(
+                    stdout: Data("deployed revision\n".utf8),
+                    stderr: Data("notice\n".utf8),
+                    exitCode: 0
+                )
+            },
+            environment: ["PATH": tempDirectory.path, "UNRELATED_SECRET": "do-not-pass-through"],
+            brunoEvaluator: StubBrunoGuardEvaluator { event in
+                guard case .object(let root) = event,
+                      case .object(let action)? = root["action"] else {
+                    XCTFail("expected Bruno CLI profile event")
+                    return BrunoGuardDecision(decision: "deny")
+                }
+                XCTAssertEqual(action["kind"], .string("broker.cli_profile.run"))
+                XCTAssertEqual(action["profile_id"], .string("gcloud.run.deploy.sandbox"))
+                return BrunoGuardDecision(decision: "allow")
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+
+        let result = try await runner.run(RemoteAuthorityCLIProfileRequest(
+            profileID: "gcloud.run.deploy.sandbox",
+            parameters: [
+                "service": "aegis-smoke",
+                "image": "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                "region": "us-central1",
+                "project": "mithran-sandbox",
+            ],
+            cwd: tempDirectory.path,
+            authLeaseRef: "auth-lease://gcp/run/deploy",
+            grantRef: "auth-grant://cloud_deploy_mutation/sandbox",
+            credentialRef: "\(secretEnvironmentReferencePrefix)gcp-run-token",
+            requester: "Codex",
+            projectRef: "project://d79",
+            resourceScopeRef: "gcp-run://mithran-sandbox/us-central1/aegis-smoke",
+            sessionRef: "agent-session://local/test"
+        ))
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.evidence.schemaVersion, "aegis.broker.remote_authority_evidence.v1")
+        XCTAssertEqual(result.evidence.profileID, "gcloud.run.deploy.sandbox")
+        XCTAssertEqual(result.evidence.authLeaseRef, "auth-lease://gcp/run/deploy")
+        XCTAssertEqual(result.evidence.grantClass, "cloud_deploy_mutation")
+        XCTAssertEqual(result.evidence.credentialClass, "gcp_access_token")
+        XCTAssertEqual(result.evidence.argvTemplate, ["run", "deploy", "[PARAM]", "--image", "[PARAM]", "--region", "[PARAM]", "--project", "[PARAM]", "--quiet"])
+        XCTAssertTrue(result.evidence.argvTemplateDigest.hasPrefix("sha256:"))
+        XCTAssertTrue(result.evidence.commandDigest.hasPrefix("sha256:"))
+        XCTAssertTrue(result.evidence.brunoDecisionRef.hasPrefix("bruno-decision://gcloud.run.deploy.sandbox/"))
+        XCTAssertEqual(result.evidence.executionMode, "broker_job")
+        XCTAssertEqual(result.evidence.result, "allowed")
+        XCTAssertEqual(result.evidence.cleanupStatus, "credentials_dropped")
+        XCTAssertEqual(result.evidence.redactionState, "metadata_only_sha256")
+        XCTAssertFalse(result.evidence.rawCredentialMaterialPrinted)
+        XCTAssertEqual(result.evidence.output.stdoutBytes, 18)
+        XCTAssertFalse(encoded.contains("secret-token-123"))
+        XCTAssertFalse(encoded.contains("\(secretEnvironmentReferencePrefix)gcp-run-token"))
+        XCTAssertFalse(encoded.contains("CLOUDSDK_AUTH_ACCESS_TOKEN"))
+    }
+
+    func testCLIProfileEquivalentWorkerInvocationFailsWithoutCredential() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executableURL = try makeExecutable(named: "gcloud", in: tempDirectory, contents: "#!/bin/zsh\nexit 1\n")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(name: "gcloud", command: executableURL.path)
+            ])
+        ).write(to: commandFile)
+
+        let runner = WrappedCommandRunner(
+            commandStore: CommandStore(fileURL: commandFile),
+            authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
+            executor: MockCommandExecutor { request in
+                XCTAssertNil(request.environment["CLOUDSDK_AUTH_ACCESS_TOKEN"])
+                XCTAssertEqual(request.arguments, [
+                    "run", "deploy", "aegis-smoke",
+                    "--image", "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                    "--region", "us-central1",
+                    "--project", "mithran-sandbox",
+                    "--quiet",
+                ])
+                return RawCommandExecutionResult(
+                    stdout: Data(),
+                    stderr: Data("missing credentials\n".utf8),
+                    exitCode: 1
+                )
+            },
+            environment: ["PATH": tempDirectory.path]
+        )
+
+        let result = try await runner.run(
+            name: "gcloud",
+            args: [
+                "run", "deploy", "aegis-smoke",
+                "--image", "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                "--region", "us-central1",
+                "--project", "mithran-sandbox",
+                "--quiet",
+            ],
+            requester: "Codex"
+        )
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertEqual(result.stderr, "missing credentials\n")
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(result.receipt), as: UTF8.self).contains("secret-token-123"))
+    }
+
+    func testCLIProfileUnsupportedProfileFailsClosedBeforeLeaseAndExec() async throws {
+        let runner = RemoteAuthorityCLIProfileRunner(
+            catalog: RemoteAuthorityCLIProfileCatalog(profiles: []),
+            leaseProvider: StubCLIProfileLeaseProvider { _, _ in
+                XCTFail("lease should not be requested for unsupported profiles")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "auth-grant://unexpected", token: "secret-token-123")
+            },
+            executor: MockCommandExecutor { _ in
+                XCTFail("executor should not run for unsupported profiles")
+                return RawCommandExecutionResult(stdout: Data(), stderr: Data(), exitCode: 0)
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(cliProfileRequest(parameters: [:], cwd: nil))
+            XCTFail("expected unsupported profile failure")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_cli_profile_unsupported"))
+        }
+    }
+
+    func testCLIProfileRejectsUnsafeParametersBeforeLeaseAndExec() async throws {
+        let tempDirectory = try temporaryDirectory()
+        _ = try makeExecutable(named: "gcloud", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let runner = RemoteAuthorityCLIProfileRunner(
+            leaseProvider: StubCLIProfileLeaseProvider { _, _ in
+                XCTFail("lease should not be requested when parameters are unsafe")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "auth-grant://unexpected", token: "secret-token-123")
+            },
+            commandStore: CommandStore(
+                fileURL: tempDirectory.appendingPathComponent("commands.json"),
+                environment: ["PATH": tempDirectory.path]
+            ),
+            executor: MockCommandExecutor { _ in
+                XCTFail("executor should not run when parameters are unsafe")
+                return RawCommandExecutionResult(stdout: Data(), stderr: Data(), exitCode: 0)
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(cliProfileRequest(
+                parameters: [
+                    "service": "aegis-smoke;rm",
+                    "image": "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                    "region": "us-central1",
+                    "project": "mithran-sandbox",
+                ],
+                cwd: "/workspace"
+            ))
+            XCTFail("expected unsafe parameter failure")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_policy_denied"))
+            XCTAssertTrue(error.description.contains("unsafe CLI profile parameter"))
         }
     }
 
@@ -1462,6 +1688,21 @@ final class AegisSecretCoreTests: XCTestCase {
             payload["body"] = .string(body)
         }
         return .object(payload)
+    }
+
+    private func cliProfileRequest(parameters: [String: String], cwd: String?) -> RemoteAuthorityCLIProfileRequest {
+        RemoteAuthorityCLIProfileRequest(
+            profileID: "gcloud.run.deploy.sandbox",
+            parameters: parameters,
+            cwd: cwd,
+            authLeaseRef: "auth-lease://gcp/run/deploy",
+            grantRef: "auth-grant://cloud_deploy_mutation/sandbox",
+            credentialRef: "\(secretEnvironmentReferencePrefix)gcp-run-token",
+            requester: "Codex",
+            projectRef: "project://d79",
+            resourceScopeRef: "gcp-run://mithran-sandbox/us-central1/aegis-smoke",
+            sessionRef: "agent-session://local/test"
+        )
     }
 
     private func writeLeaseFile(_ file: ApprovalLeaseFile, to url: URL) throws {
