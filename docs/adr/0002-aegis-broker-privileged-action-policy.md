@@ -209,9 +209,12 @@ wrapped command.
 
 The current wrapped-command config remains the compatibility source for command
 summaries, command execution defaults, approval leases, and legacy MCP callers.
-Broker policy is the PreTool classifier. If both systems know a command, the
-broker classifier decides whether the direct shell command may proceed, whether
-Bruno must run, or whether MCP is required.
+Broker policy is the PreTool classifier. In the compatibility config,
+`deny_prefixes` means the command must not run through direct shell or
+`run_command`, while `broker_required_prefixes` means direct shell must reroute
+to Broker MCP and `run_command` may execute after approval. If both systems know
+a command, the broker classifier decides whether the direct shell command may
+proceed, whether Bruno must run, or whether MCP is required.
 
 Ordinary commands pass through by default. For example, `gh issue list`,
 `terraform plan`, `git status`, and read-only inspection commands must not be

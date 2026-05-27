@@ -390,6 +390,7 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
     public let timeoutSeconds: Int?
     public let maxOutputBytes: Int?
     public let denyPrefixes: [[String]]?
+    public let brokerRequiredPrefixes: [[String]]?
     public let allowPrefixes: [[String]]?
     public let denyFlags: [String]?
     public let environment: [String: String]?
@@ -402,6 +403,7 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
         approvalWindowSeconds: Int? = nil,
         timeoutSeconds: Int? = nil,
         maxOutputBytes: Int? = nil,
+        brokerRequiredPrefixes: [[String]]? = nil,
         denyPrefixes: [[String]]? = nil,
         allowPrefixes: [[String]]? = nil,
         denyFlags: [String]? = nil,
@@ -415,6 +417,7 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
         self.timeoutSeconds = timeoutSeconds
         self.maxOutputBytes = maxOutputBytes
         self.denyPrefixes = denyPrefixes
+        self.brokerRequiredPrefixes = brokerRequiredPrefixes
         self.allowPrefixes = allowPrefixes
         self.denyFlags = denyFlags
         self.environment = environment
@@ -429,24 +432,37 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
         case timeoutSeconds = "timeout_seconds"
         case maxOutputBytes = "max_output_bytes"
         case denyPrefixes = "deny_prefixes"
+        case brokerRequiredPrefixes = "broker_required_prefixes"
         case allowPrefixes = "allow_prefixes"
         case denyFlags = "deny_flags"
         case environment
     }
 
     public func merged(over base: WrappedCommandConfig?) -> WrappedCommandConfig {
-        WrappedCommandConfig(
+        let mergedEnabled = enabled ?? base?.enabled
+        let mergedCommand = command ?? base?.command
+        let mergedDescription = description ?? base?.description
+        let mergedApprovalWindowSeconds = approvalWindowSeconds ?? base?.approvalWindowSeconds
+        let mergedTimeoutSeconds = timeoutSeconds ?? base?.timeoutSeconds
+        let mergedMaxOutputBytes = maxOutputBytes ?? base?.maxOutputBytes
+        let mergedBrokerRequiredPrefixes = brokerRequiredPrefixes ?? base?.brokerRequiredPrefixes
+        let mergedDenyPrefixes = denyPrefixes ?? base?.denyPrefixes
+        let mergedAllowPrefixes = allowPrefixes ?? base?.allowPrefixes
+        let mergedDenyFlags = denyFlags ?? base?.denyFlags
+        let mergedEnvironment = environment ?? base?.environment
+        return WrappedCommandConfig(
             name: name,
-            enabled: enabled ?? base?.enabled,
-            command: command ?? base?.command,
-            description: description ?? base?.description,
-            approvalWindowSeconds: approvalWindowSeconds ?? base?.approvalWindowSeconds,
-            timeoutSeconds: timeoutSeconds ?? base?.timeoutSeconds,
-            maxOutputBytes: maxOutputBytes ?? base?.maxOutputBytes,
-            denyPrefixes: denyPrefixes ?? base?.denyPrefixes,
-            allowPrefixes: allowPrefixes ?? base?.allowPrefixes,
-            denyFlags: denyFlags ?? base?.denyFlags,
-            environment: environment ?? base?.environment
+            enabled: mergedEnabled,
+            command: mergedCommand,
+            description: mergedDescription,
+            approvalWindowSeconds: mergedApprovalWindowSeconds,
+            timeoutSeconds: mergedTimeoutSeconds,
+            maxOutputBytes: mergedMaxOutputBytes,
+            brokerRequiredPrefixes: mergedBrokerRequiredPrefixes,
+            denyPrefixes: mergedDenyPrefixes,
+            allowPrefixes: mergedAllowPrefixes,
+            denyFlags: mergedDenyFlags,
+            environment: mergedEnvironment
         )
     }
 
@@ -481,6 +497,11 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
         }
 
         let normalizedDenyPrefixes = try normalizePrefixes(denyPrefixes, name: trimmedName, field: "deny_prefixes")
+        let normalizedBrokerRequiredPrefixes = try normalizePrefixes(
+            brokerRequiredPrefixes,
+            name: trimmedName,
+            field: "broker_required_prefixes"
+        )
         let normalizedAllowPrefixes = try normalizePrefixes(allowPrefixes, name: trimmedName, field: "allow_prefixes")
         let normalizedFlags = try normalizeFlags(denyFlags, name: trimmedName)
         let normalizedEnvironment = try normalizeEnvironment(environment, name: trimmedName)
@@ -493,6 +514,7 @@ public struct WrappedCommandConfig: Codable, Equatable, Sendable {
             timeoutSeconds: resolvedTimeout,
             maxOutputBytes: resolvedMaxOutputBytes,
             denyPrefixes: normalizedDenyPrefixes,
+            brokerRequiredPrefixes: normalizedBrokerRequiredPrefixes,
             allowPrefixes: normalizedAllowPrefixes,
             denyFlags: normalizedFlags,
             environment: normalizedEnvironment
@@ -564,6 +586,15 @@ public struct CommandFile: Codable, Equatable, Sendable {
                     name: "aws",
                     command: "aws",
                     description: "AWS CLI",
+                    brokerRequiredPrefixes: [
+                        ["cloudformation", "deploy"],
+                        ["cloudformation", "create-stack"],
+                        ["cloudformation", "update-stack"],
+                        ["cloudformation", "delete-stack"],
+                        ["ecs", "update-service"],
+                        ["lambda", "update-function-code"],
+                        ["s3", "rm"]
+                    ],
                     denyPrefixes: [
                         ["configure"],
                         ["sts", "assume-role"],
@@ -582,6 +613,16 @@ public struct CommandFile: Codable, Equatable, Sendable {
                     name: "gcloud",
                     command: "gcloud",
                     description: "Google Cloud CLI",
+                    brokerRequiredPrefixes: [
+                        ["run", "deploy"],
+                        ["functions", "deploy"],
+                        ["app", "deploy"],
+                        ["container", "clusters", "create"],
+                        ["container", "clusters", "delete"],
+                        ["deployment-manager", "deployments", "create"],
+                        ["deployment-manager", "deployments", "update"],
+                        ["deployment-manager", "deployments", "delete"]
+                    ],
                     denyPrefixes: [["auth"], ["config", "config-helper"]],
                     denyFlags: ["--access-token-file"]
                 ),
@@ -589,7 +630,7 @@ public struct CommandFile: Codable, Equatable, Sendable {
                     name: "kubectl",
                     command: "kubectl",
                     description: "Kubernetes CLI",
-                    denyPrefixes: [
+                    brokerRequiredPrefixes: [
                         ["apply"],
                         ["create"],
                         ["delete"],
@@ -605,7 +646,7 @@ public struct CommandFile: Codable, Equatable, Sendable {
                     name: "terraform",
                     command: "terraform",
                     description: "Terraform CLI",
-                    denyPrefixes: [
+                    brokerRequiredPrefixes: [
                         ["apply"],
                         ["destroy"],
                         ["import"],
@@ -618,14 +659,16 @@ public struct CommandFile: Codable, Equatable, Sendable {
                     name: "az",
                     command: "az",
                     description: "Azure CLI",
-                    denyPrefixes: [
-                        ["login"],
-                        ["account", "set"],
-                        ["configure"],
+                    brokerRequiredPrefixes: [
                         ["deployment", "group", "create"],
                         ["deployment", "sub", "create"],
                         ["deployment", "mg", "create"],
                         ["deployment", "tenant", "create"]
+                    ],
+                    denyPrefixes: [
+                        ["login"],
+                        ["account", "set"],
+                        ["configure"]
                     ],
                     denyFlags: ["--debug"]
                 ),
@@ -658,6 +701,7 @@ public struct ResolvedWrappedCommand: Equatable, Sendable {
     public let timeoutSeconds: Int
     public let maxOutputBytes: Int
     public let denyPrefixes: [[String]]
+    public let brokerRequiredPrefixes: [[String]]
     public let allowPrefixes: [[String]]
     public let denyFlags: Set<String>
     public let environment: [String: String]
@@ -1015,6 +1059,7 @@ private struct FingerprintPolicy: Codable {
     let timeoutSeconds: Int
     let maxOutputBytes: Int
     let denyPrefixes: [[String]]
+    let brokerRequiredPrefixes: [[String]]
     let allowPrefixes: [[String]]
     let denyFlags: [String]
     let environment: [FingerprintEnvironmentValue]
@@ -1029,6 +1074,7 @@ public func approvalPolicyFingerprint(for command: ResolvedWrappedCommand, execu
         timeoutSeconds: command.timeoutSeconds,
         maxOutputBytes: command.maxOutputBytes,
         denyPrefixes: command.denyPrefixes,
+        brokerRequiredPrefixes: command.brokerRequiredPrefixes,
         allowPrefixes: command.allowPrefixes,
         denyFlags: command.denyFlags.sorted(),
         environment: command.environment.map { FingerprintEnvironmentValue(key: $0.key, value: $0.value) }.sorted()
@@ -1469,6 +1515,7 @@ public struct ToolDecisionMatchedPolicy: Codable, Equatable, Sendable {
     public let timeoutSeconds: Int
     public let maxOutputBytes: Int
     public let denyPrefixes: [[String]]
+    public let brokerRequiredPrefixes: [[String]]
     public let allowPrefixes: [[String]]
     public let denyFlags: [String]
 
@@ -1481,6 +1528,7 @@ public struct ToolDecisionMatchedPolicy: Codable, Equatable, Sendable {
         timeoutSeconds: Int,
         maxOutputBytes: Int,
         denyPrefixes: [[String]],
+        brokerRequiredPrefixes: [[String]],
         allowPrefixes: [[String]],
         denyFlags: [String]
     ) {
@@ -1492,6 +1540,7 @@ public struct ToolDecisionMatchedPolicy: Codable, Equatable, Sendable {
         self.timeoutSeconds = timeoutSeconds
         self.maxOutputBytes = maxOutputBytes
         self.denyPrefixes = denyPrefixes
+        self.brokerRequiredPrefixes = brokerRequiredPrefixes
         self.allowPrefixes = allowPrefixes
         self.denyFlags = denyFlags
     }
@@ -1505,8 +1554,24 @@ public struct ToolDecisionMatchedPolicy: Codable, Equatable, Sendable {
         case timeoutSeconds = "timeout_seconds"
         case maxOutputBytes = "max_output_bytes"
         case denyPrefixes = "deny_prefixes"
+        case brokerRequiredPrefixes = "broker_required_prefixes"
         case allowPrefixes = "allow_prefixes"
         case denyFlags = "deny_flags"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        commandName = try container.decode(String.self, forKey: .commandName)
+        command = try container.decode(String.self, forKey: .command)
+        executablePath = try container.decodeIfPresent(String.self, forKey: .executablePath)
+        policyFingerprint = try container.decodeIfPresent(String.self, forKey: .policyFingerprint)
+        approvalWindowSeconds = try container.decode(Int.self, forKey: .approvalWindowSeconds)
+        timeoutSeconds = try container.decode(Int.self, forKey: .timeoutSeconds)
+        maxOutputBytes = try container.decode(Int.self, forKey: .maxOutputBytes)
+        denyPrefixes = try container.decode([[String]].self, forKey: .denyPrefixes)
+        brokerRequiredPrefixes = try container.decodeIfPresent([[String]].self, forKey: .brokerRequiredPrefixes) ?? []
+        allowPrefixes = try container.decode([[String]].self, forKey: .allowPrefixes)
+        denyFlags = try container.decode([String].self, forKey: .denyFlags)
     }
 }
 
@@ -2970,6 +3035,7 @@ public struct WrappedCommandRunner: Sendable {
             timeoutSeconds: command.timeoutSeconds,
             maxOutputBytes: command.maxOutputBytes,
             denyPrefixes: command.denyPrefixes,
+            brokerRequiredPrefixes: command.brokerRequiredPrefixes,
             allowPrefixes: command.allowPrefixes,
             denyFlags: command.denyFlags.sorted()
         )
@@ -3102,10 +3168,16 @@ public func codexPreToolUseDenyHookOutput(reason: String) throws -> String {
 public struct ShellGuardWrappedCommand: Equatable, Sendable {
     public let name: String
     public let denyPrefixes: [[String]]
+    public let brokerRequiredPrefixes: [[String]]
 
-    public init(name: String, denyPrefixes: [[String]] = []) {
+    public init(
+        name: String,
+        denyPrefixes: [[String]] = [],
+        brokerRequiredPrefixes: [[String]] = []
+    ) {
         self.name = name
         self.denyPrefixes = denyPrefixes
+        self.brokerRequiredPrefixes = brokerRequiredPrefixes
     }
 }
 
@@ -3220,7 +3292,11 @@ public struct ShellBypassGuard: Sendable {
     ) {
         self.init(
             wrappedCommands: resolvedCommands.map {
-                ShellGuardWrappedCommand(name: $0.name, denyPrefixes: $0.denyPrefixes)
+                ShellGuardWrappedCommand(
+                    name: $0.name,
+                    denyPrefixes: $0.denyPrefixes,
+                    brokerRequiredPrefixes: $0.brokerRequiredPrefixes
+                )
             },
             brunoEvaluator: brunoEvaluator
         )
@@ -3249,6 +3325,10 @@ public struct ShellBypassGuard: Sendable {
                 return await evaluateProtectedGitHubMutation(protected, commandName: executableName, args: args)
             }
 
+            if directDenied(commandName: executableName, args: args) {
+                return directDeniedBlocked(commandName: executableName)
+            }
+
             if brokerRequired(commandName: executableName, args: args) {
                 return brokerRequiredBlocked(commandName: executableName)
             }
@@ -3261,6 +3341,9 @@ public struct ShellBypassGuard: Sendable {
                 let passthroughArgs = passthroughRunArguments(tokens: tokens, start: executableIndex + 3)
                 if commandName == "gh", let protected = protectedGitHubMutation(args: passthroughArgs) {
                     return await evaluateProtectedGitHubMutation(protected, commandName: commandName, args: passthroughArgs)
+                }
+                if directDenied(commandName: commandName, args: passthroughArgs) {
+                    return directDeniedBlocked(commandName: commandName)
                 }
                 if brokerRequired(commandName: commandName, args: passthroughArgs) {
                     return brokerRequiredBlocked(commandName: commandName)
@@ -3321,7 +3404,21 @@ public struct ShellBypassGuard: Sendable {
         guard let command = wrappedCommands[commandName] else {
             return false
         }
+        return command.brokerRequiredPrefixes.contains { matchesPrefix(args, prefix: $0) }
+    }
+
+    private func directDenied(commandName: String, args: [String]) -> Bool {
+        guard let command = wrappedCommands[commandName] else {
+            return false
+        }
         return command.denyPrefixes.contains { matchesPrefix(args, prefix: $0) }
+    }
+
+    private func directDeniedBlocked(commandName: String) -> ShellGuardResult {
+        ShellGuardResult(
+            allowed: false,
+            message: "Blocked direct shell use of denied command `\(commandName)`. Try a safer non-sensitive subcommand, or use Aegis Broker MCP only for configured privileged actions."
+        )
     }
 
     private func brokerRequiredBlocked(commandName: String) -> ShellGuardResult {

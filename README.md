@@ -189,7 +189,8 @@ Out of the box, Aegis ships wrappers for:
 
 The wrapped-command defaults remain for compatibility and brokered privileged
 execution. They include obvious deny rules for credential and auth-management
-paths.
+paths, plus broker-required rules for privileged mutations that should not run
+directly from an agent shell.
 
 Examples:
 
@@ -197,7 +198,8 @@ Examples:
 - `aws sts assume-role ...` is blocked
 - `aws ecr get-login-password` is blocked
 - `gcloud auth ...` is blocked
-- `kubectl apply ...` is blocked
+- `gcloud run deploy ...` requires the brokered privileged path
+- `kubectl apply ...` requires the brokered privileged path
 - `terraform apply` requires the brokered privileged path
 - `az login` is blocked
 
@@ -226,7 +228,8 @@ Example custom `~/.config/aegis-secret/commands.local.json`:
       "description": "Kubernetes CLI",
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
-      "max_output_bytes": 262144
+      "max_output_bytes": 262144,
+      "broker_required_prefixes": [["apply"], ["delete"]]
     }
   ]
 }
