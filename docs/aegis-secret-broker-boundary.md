@@ -70,3 +70,6 @@ child process, and returns redacted output.
 
 The concrete policy schema is defined in
 `docs/adr/0002-aegis-broker-privileged-action-policy.md`.
+
+D79 brokered remote authority for credential-starved protected workers is
+defined in `docs/d79-broker-remote-authority-contract.md`.
