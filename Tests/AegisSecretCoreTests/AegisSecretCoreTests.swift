@@ -235,6 +235,15 @@ final class AegisSecretCoreTests: XCTestCase {
 
         let names = try store.listCommands().map(\.name)
         XCTAssertEqual(names, ["aws", "az", "gcloud", "gh", "kubectl", "terraform"])
+
+        let terraform = try store.resolvedCommand(named: "terraform")
+        XCTAssertTrue(terraform.brokerRequiredPrefixes.contains(["apply"]))
+        XCTAssertTrue(terraform.brokerRequiredPrefixes.contains(["destroy"]))
+        XCTAssertFalse(terraform.denyPrefixes.contains(["apply"]))
+
+        let gcloud = try store.resolvedCommand(named: "gcloud")
+        XCTAssertTrue(gcloud.brokerRequiredPrefixes.contains(["run", "deploy"]))
+        XCTAssertTrue(gcloud.denyPrefixes.contains(["auth"]))
     }
 
     func testCommandStoreMergesSystemAndUserOverrides() throws {
@@ -337,6 +346,53 @@ final class AegisSecretCoreTests: XCTestCase {
             XCTAssertTrue(error.description.contains("not allowed"))
             XCTAssertTrue(error.description.contains("gh api /user"))
         }
+    }
+
+    func testRunnerAllowsBrokerRequiredTerraformMutationThroughMCP() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executablePath = try makeExecutable(named: "terraform", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let systemFile = tempDirectory.appendingPathComponent("system-commands.json")
+        let commandFile = tempDirectory.appendingPathComponent("commands.json")
+        try prettyJSON(CommandFile(commands: [])).write(to: systemFile)
+        try prettyJSON(
+            CommandFile(commands: [
+                WrappedCommandConfig(
+                    name: "terraform",
+                    command: executablePath.path,
+                    brokerRequiredPrefixes: [["apply"]]
+                )
+            ])
+        ).write(to: commandFile)
+
+        let runner = WrappedCommandRunner(
+            commandStore: CommandStore(
+                fileURL: commandFile,
+                environment: [systemCommandsFileEnvironmentKey: systemFile.path]
+            ),
+            authenticator: AuthRecorder(),
+            approvalCache: ApprovalCache(leaseFileURL: nil),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.arguments, ["apply", "-auto-approve"])
+                return RawCommandExecutionResult(
+                    stdout: Data("apply complete\n".utf8),
+                    stderr: Data(),
+                    exitCode: 0
+                )
+            }
+        )
+
+        let result = try await runner.run(
+            name: "terraform",
+            args: ["apply", "-auto-approve"],
+            requester: "Codex",
+            surface: "mcp"
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.stdout, "apply complete\n")
+        XCTAssertEqual(result.receipt.decision, "allow")
+        XCTAssertEqual(result.receipt.matchedPolicy?.brokerRequiredPrefixes, [["apply"]])
+        XCTAssertEqual(result.receipt.redaction.rawSecretMCPCRUDAvailable, false)
     }
 
     func testRunnerRejectsDeniedFlagWithEqualsSyntax() async throws {
@@ -1288,24 +1344,34 @@ final class AegisSecretCoreTests: XCTestCase {
 
     func testShellGuardBlocksBrokerRequiredWrappedCommand() async {
         let result = await ShellBypassGuard(wrappedCommands: [
-            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
-        ]).evaluate(command: "/opt/homebrew/bin/gh auth status")
+            ShellGuardWrappedCommand(name: "terraform", brokerRequiredPrefixes: [["apply"]])
+        ]).evaluate(command: "/opt/homebrew/bin/terraform apply")
 
         XCTAssertFalse(result.allowed)
-        XCTAssertTrue(result.message.contains("privileged command `gh`"))
+        XCTAssertTrue(result.message.contains("privileged command `terraform`"))
         XCTAssertTrue(result.message.contains("list_commands"))
         XCTAssertTrue(result.message.contains("run_command"))
     }
 
     func testShellGuardBrokerRequiredMessageDoesNotEchoSecretLikeArguments() async {
         let result = await ShellBypassGuard(wrappedCommands: [
-            ShellGuardWrappedCommand(name: "terraform", denyPrefixes: [["apply"]])
+            ShellGuardWrappedCommand(name: "terraform", brokerRequiredPrefixes: [["apply"]])
         ]).evaluate(command: "terraform apply -var password=super-secret-token")
 
         XCTAssertFalse(result.allowed)
         XCTAssertTrue(result.message.contains("Aegis Broker MCP"))
         XCTAssertFalse(result.message.contains("super-secret-token"))
         XCTAssertFalse(result.message.contains("password="))
+    }
+
+    func testShellGuardDeniesNeverAllowedWrappedCommandWithoutBrokerReroute() async {
+        let result = await ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ]).evaluate(command: "gh auth token")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("denied command `gh`"))
+        XCTAssertFalse(result.message.contains("then `run_command` for `gh`"))
     }
 
     func testCodexPreToolUseDenyHookOutputUsesSupportedShape() throws {
@@ -1427,7 +1493,7 @@ final class AegisSecretCoreTests: XCTestCase {
 
     func testShellGuardBlocksTerraformApplyThroughBrokerMCP() async {
         let result = await ShellBypassGuard(wrappedCommands: [
-            ShellGuardWrappedCommand(name: "terraform", denyPrefixes: [["apply"]])
+            ShellGuardWrappedCommand(name: "terraform", brokerRequiredPrefixes: [["apply"]])
         ]).evaluate(command: "terraform apply")
 
         XCTAssertFalse(result.allowed)

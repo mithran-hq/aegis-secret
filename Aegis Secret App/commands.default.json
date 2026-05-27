@@ -22,6 +22,15 @@
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
       "max_output_bytes": 262144,
+      "broker_required_prefixes": [
+        ["cloudformation", "deploy"],
+        ["cloudformation", "create-stack"],
+        ["cloudformation", "update-stack"],
+        ["cloudformation", "delete-stack"],
+        ["ecs", "update-service"],
+        ["lambda", "update-function-code"],
+        ["s3", "rm"]
+      ],
       "deny_prefixes": [
         ["configure"],
         ["sts", "assume-role"],
@@ -43,6 +52,16 @@
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
       "max_output_bytes": 262144,
+      "broker_required_prefixes": [
+        ["run", "deploy"],
+        ["functions", "deploy"],
+        ["app", "deploy"],
+        ["container", "clusters", "create"],
+        ["container", "clusters", "delete"],
+        ["deployment-manager", "deployments", "create"],
+        ["deployment-manager", "deployments", "update"],
+        ["deployment-manager", "deployments", "delete"]
+      ],
       "deny_prefixes": [
         ["auth"],
         ["config", "config-helper"]
@@ -56,7 +75,7 @@
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
       "max_output_bytes": 262144,
-      "deny_prefixes": [
+      "broker_required_prefixes": [
         ["apply"],
         ["create"],
         ["delete"],
@@ -75,7 +94,7 @@
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
       "max_output_bytes": 262144,
-      "deny_prefixes": [
+      "broker_required_prefixes": [
         ["apply"],
         ["destroy"],
         ["import"],
@@ -91,14 +110,16 @@
       "approval_window_seconds": 300,
       "timeout_seconds": 30,
       "max_output_bytes": 262144,
-      "deny_prefixes": [
-        ["login"],
-        ["account", "set"],
-        ["configure"],
+      "broker_required_prefixes": [
         ["deployment", "group", "create"],
         ["deployment", "sub", "create"],
         ["deployment", "mg", "create"],
         ["deployment", "tenant", "create"]
+      ],
+      "deny_prefixes": [
+        ["login"],
+        ["account", "set"],
+        ["configure"]
       ],
       "deny_flags": ["--debug"]
     }

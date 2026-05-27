@@ -52,6 +52,7 @@ redaction metadata.
   "exit_code": 0,
   "matched_policy": {
     "allow_prefixes": [],
+    "broker_required_prefixes": [],
     "approval_window_seconds": 21600,
     "command": "gh",
     "command_name": "gh",
@@ -96,6 +97,7 @@ redaction metadata.
   "error": "The `auth` subcommand is not allowed for wrapped command `gh`.",
   "matched_policy": {
     "allow_prefixes": [],
+    "broker_required_prefixes": [],
     "approval_window_seconds": 21600,
     "command": "gh",
     "command_name": "gh",
