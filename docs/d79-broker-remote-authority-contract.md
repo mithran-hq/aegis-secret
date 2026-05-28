@@ -183,6 +183,11 @@ remote-authority action or profile may run, redeems the Auth lease, scopes the
 credential materialization, launches the trusted action/profile, and records
 evidence.
 
+On Linux developer hosts, the credential storage lane is the MAP/GCP authority
+described in `docs/linux-map-gcp-broker-authority.md`. It resolves broker refs
+through MAP sign-in and GCP Secret Manager, while raw secret CRUD stays
+unavailable.
+
 The compatibility package may expose both `aegis-secret` and `aegis-broker`
 names from the same binary, but public contracts should call the authority lane
 Broker and the storage lane Aegis Secret.

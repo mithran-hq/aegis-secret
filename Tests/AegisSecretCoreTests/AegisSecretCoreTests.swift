@@ -51,6 +51,27 @@ struct MockCommandExecutor: CommandExecutor {
     }
 }
 
+final class LinuxMAPGCPCommandRecorder: @unchecked Sendable {
+    struct Invocation: Equatable {
+        let executable: String
+        let arguments: [String]
+    }
+
+    private(set) var invocations: [Invocation] = []
+
+    func append(executable: String, arguments: [String]) {
+        invocations.append(Invocation(executable: executable, arguments: arguments))
+    }
+}
+
+struct MockLinuxMAPGCPCommandExecutor: LinuxMAPGCPCommandExecuting {
+    let handler: @Sendable (String, [String], [String: String]) throws -> LinuxMAPGCPCommandResult
+
+    func execute(executable: String, arguments: [String], environment: [String: String]) throws -> LinuxMAPGCPCommandResult {
+        try handler(executable, arguments, environment)
+    }
+}
+
 struct StubBrunoGuardEvaluator: BrunoGuardEvaluating {
     let handler: @Sendable (JSONValue) async throws -> BrunoGuardDecision
 
@@ -140,6 +161,210 @@ final class AegisSecretCoreTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.map(\.key), ["AWS_TOKEN", "GITHUB_TOKEN", "ZED"])
+    }
+
+    func testLinuxMAPGCPStoreResolvesSecretThroughActiveMAPAccount() throws {
+        let recorder = LinuxMAPGCPCommandRecorder()
+        let store = LinuxMAPGCPSecretStore(
+            projectID: "mithran-sandbox",
+            secretPrefix: "aegis-",
+            gcloudExecutable: "/usr/bin/gcloud",
+            environment: ["PATH": "/usr/bin"],
+            executor: MockLinuxMAPGCPCommandExecutor { executable, arguments, _ in
+                recorder.append(executable: executable, arguments: arguments)
+                if arguments == ["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"] {
+                    return LinuxMAPGCPCommandResult(
+                        stdout: Data("developer@mithran.ai\n".utf8),
+                        stderr: Data(),
+                        exitCode: 0
+                    )
+                }
+                if arguments == [
+                    "secrets", "versions", "access", "latest",
+                    "--project", "mithran-sandbox",
+                    "--secret", "aegis-github-token",
+                ] {
+                    return LinuxMAPGCPCommandResult(
+                        stdout: Data("secret-token-123".utf8),
+                        stderr: Data(),
+                        exitCode: 0
+                    )
+                }
+                XCTFail("unexpected gcloud invocation: \(arguments)")
+                return LinuxMAPGCPCommandResult(stdout: Data(), stderr: Data(), exitCode: 1)
+            }
+        )
+
+        let token = try store.readSecret(for: "github-token", reason: "test")
+
+        XCTAssertEqual(String(decoding: token, as: UTF8.self), "secret-token-123")
+        XCTAssertEqual(recorder.invocations.map(\.executable), ["/usr/bin/gcloud", "/usr/bin/gcloud"])
+    }
+
+    func testDefaultSecretStoreCanSelectLinuxMAPGCPAuthority() throws {
+        let store = defaultSecretStore(environment: [
+            "AEGIS_SECRET_AUTHORITY": "map-gcp",
+            "AEGIS_SECRET_GCP_PROJECT": "mithran-sandbox",
+        ])
+
+        XCTAssertTrue(store is LinuxMAPGCPSecretStore)
+    }
+
+    func testLinuxMAPGCPStoreFailsClosedWithoutProjectOrMAPAccount() throws {
+        let store = LinuxMAPGCPSecretStore(
+            environment: [:],
+            executor: MockLinuxMAPGCPCommandExecutor { _, _, _ in
+                XCTFail("gcloud should not run without project configuration")
+                return LinuxMAPGCPCommandResult(stdout: Data(), stderr: Data(), exitCode: 1)
+            }
+        )
+
+        XCTAssertThrowsError(try store.readSecret(for: "github-token", reason: "test")) { error in
+            XCTAssertTrue(String(describing: error).contains("broker_auth_lease_denied"))
+            XCTAssertTrue(String(describing: error).contains("AEGIS_SECRET_GCP_PROJECT"))
+        }
+
+        let missingMAPStore = LinuxMAPGCPSecretStore(
+            projectID: "mithran-sandbox",
+            executor: MockLinuxMAPGCPCommandExecutor { _, arguments, _ in
+                XCTAssertEqual(arguments, ["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"])
+                return LinuxMAPGCPCommandResult(stdout: Data(), stderr: Data("not logged in".utf8), exitCode: 1)
+            }
+        )
+
+        XCTAssertThrowsError(try missingMAPStore.readSecret(for: "github-token", reason: "test")) { error in
+            XCTAssertTrue(String(describing: error).contains("broker_auth_lease_denied"))
+            XCTAssertTrue(String(describing: error).contains("MAP sign-in"))
+        }
+    }
+
+    func testLinuxMAPGCPStoreMapsDeniedAndUnsafeRefsWithoutLeakingProviderDetails() throws {
+        let store = LinuxMAPGCPSecretStore(
+            projectID: "mithran-sandbox",
+            mapAccount: "developer@mithran.ai",
+            executor: MockLinuxMAPGCPCommandExecutor { _, _, _ in
+                LinuxMAPGCPCommandResult(
+                    stdout: Data(),
+                    stderr: Data("PERMISSION_DENIED secret projects/mithran-sandbox/secrets/private-token".utf8),
+                    exitCode: 1
+                )
+            }
+        )
+
+        XCTAssertThrowsError(try store.readSecret(for: "private-token", reason: "test")) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("broker_credential_materialization_failed"))
+            XCTAssertTrue(message.contains("IAM denied"))
+            XCTAssertFalse(message.contains("private-token"))
+            XCTAssertFalse(message.contains("mithran-sandbox/secrets"))
+        }
+
+        XCTAssertThrowsError(try store.readSecret(for: "../private-token", reason: "test")) { error in
+            XCTAssertTrue(String(describing: error).contains("broker_auth_lease_denied"))
+        }
+    }
+
+    func testLinuxMAPGCPStoreRawSecretCRUDIsUnavailable() throws {
+        let store = LinuxMAPGCPSecretStore(
+            projectID: "mithran-sandbox",
+            mapAccount: "developer@mithran.ai",
+            executor: MockLinuxMAPGCPCommandExecutor { _, _, _ in
+                XCTFail("raw CRUD should not call gcloud")
+                return LinuxMAPGCPCommandResult(stdout: Data(), stderr: Data(), exitCode: 0)
+            }
+        )
+
+        XCTAssertThrowsError(try store.setSecret(Data("value".utf8), for: "github-token")) { error in
+            XCTAssertTrue(String(describing: error).contains("raw_secret_crud_unavailable"))
+        }
+        XCTAssertThrowsError(try store.listSecrets()) { error in
+            XCTAssertTrue(String(describing: error).contains("raw_secret_crud_unavailable"))
+        }
+        XCTAssertThrowsError(try store.deleteSecret(for: "github-token")) { error in
+            XCTAssertTrue(String(describing: error).contains("raw_secret_crud_unavailable"))
+        }
+    }
+
+    func testLinuxMAPGCPStoreFeedsBrokerCLIProfileWithoutLeakingCredential() async throws {
+        let tempDirectory = try temporaryDirectory()
+        let executableURL = try makeExecutable(named: "gcloud", in: tempDirectory, contents: "#!/bin/zsh\nexit 0\n")
+        let profile = RemoteAuthorityCLIProfileDescriptor(
+            profileID: "gcloud.run.deploy.sandbox",
+            tool: "gcloud",
+            argvTemplate: [
+                "run", "deploy", "{{service}}",
+                "--image", "{{image}}",
+                "--region", "{{region}}",
+                "--project", "{{project}}",
+                "--quiet",
+            ],
+            allowedCWDPrefixes: [tempDirectory.path],
+            grantClass: "cloud_deploy_mutation",
+            credentialClass: "gcp_access_token",
+            credentialEnvironmentVariable: "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            networkPolicyRef: "network-policy://d79/gcloud-run-deploy"
+        )
+        let store = LinuxMAPGCPSecretStore(
+            projectID: "mithran-sandbox",
+            mapAccount: "developer@mithran.ai",
+            executor: MockLinuxMAPGCPCommandExecutor { _, arguments, _ in
+                XCTAssertEqual(arguments, [
+                    "secrets", "versions", "access", "latest",
+                    "--project", "mithran-sandbox",
+                    "--secret", "gcp-run-token",
+                ])
+                return LinuxMAPGCPCommandResult(
+                    stdout: Data("secret-token-123".utf8),
+                    stderr: Data(),
+                    exitCode: 0
+                )
+            }
+        )
+        let runner = RemoteAuthorityCLIProfileRunner(
+            catalog: RemoteAuthorityCLIProfileCatalog(profiles: [profile]),
+            leaseProvider: SecretStoreCLIProfileLeaseProvider(secretStore: store),
+            commandStore: CommandStore(
+                fileURL: tempDirectory.appendingPathComponent("commands.json"),
+                environment: ["PATH": tempDirectory.path]
+            ),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.executableURL.path, executableURL.path)
+                XCTAssertEqual(request.environment["CLOUDSDK_AUTH_ACCESS_TOKEN"], "secret-token-123")
+                return RawCommandExecutionResult(
+                    stdout: Data("deployed\n".utf8),
+                    stderr: Data(),
+                    exitCode: 0
+                )
+            },
+            environment: ["PATH": tempDirectory.path],
+            brunoEvaluator: nil,
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+
+        let result = try await runner.run(RemoteAuthorityCLIProfileRequest(
+            profileID: "gcloud.run.deploy.sandbox",
+            parameters: [
+                "service": "aegis-smoke",
+                "image": "us-docker.pkg.dev/mithran/aegis/smoke:1",
+                "region": "us-central1",
+                "project": "mithran-sandbox",
+            ],
+            cwd: tempDirectory.path,
+            authLeaseRef: "auth-lease://gcp/run/deploy",
+            grantRef: "auth-grant://cloud_deploy_mutation/sandbox",
+            credentialRef: "\(secretEnvironmentReferencePrefix)gcp-run-token",
+            requester: "Codex"
+        ))
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.evidence.result, "allowed")
+        XCTAssertEqual(result.evidence.redactionState, "metadata_only_sha256")
+        XCTAssertFalse(result.evidence.rawCredentialMaterialPrinted)
+        XCTAssertFalse(encoded.contains("secret-token-123"))
+        XCTAssertFalse(encoded.contains("gcp-run-token"))
+        XCTAssertEqual(RemoteAuthorityCLIProfileCatalog().profiles.map(\.profileID), ["gcloud.run.deploy.sandbox"])
+        XCTAssertTrue(try CommandStore(fileURL: tempDirectory.appendingPathComponent("commands.json")).listCommands().contains { $0.name == "gcloud" })
     }
 
     func testCommandValidateFileParses() throws {

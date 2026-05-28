@@ -159,7 +159,7 @@ public final class StdioMCPServer {
         receiptRecorder: ToolDecisionReceiptRecorder = ToolDecisionReceiptRecorder()
     ) {
         self.commandStore = commandStore
-        let secretStore = KeychainSecretStore()
+        let secretStore = defaultSecretStore()
         self.runner = runner ?? WrappedCommandRunner(commandStore: commandStore, secretStore: secretStore)
         self.remoteActionRunner = remoteActionRunner ?? RemoteAuthorityActionRunner(
             leaseProvider: SecretStoreRemoteAuthorityLeaseProvider(secretStore: secretStore)

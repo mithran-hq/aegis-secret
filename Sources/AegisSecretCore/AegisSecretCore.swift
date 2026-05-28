@@ -1,7 +1,21 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
+#if canImport(LocalAuthentication)
 import LocalAuthentication
+#endif
+#if canImport(Security)
 import Security
+#endif
 
 public let aegisSecretServiceName = "Aegis Secrets"
 public let aegisSecretMetadataServiceName = "Aegis Secrets Metadata"
@@ -12,6 +26,120 @@ public let bundledCommandsResourceName = "commands.default"
 public let bundledClaudeGuidanceResourceName = "claude.guidance"
 public let bundledCodexGuidanceResourceName = "codex.guidance"
 public let secretEnvironmentReferencePrefix = "aegis-secret://"
+
+#if !canImport(CryptoKit)
+private enum SHA256 {
+    static func hash(data: Data) -> [UInt8] {
+        PureSwiftSHA256.hash(Array(data))
+    }
+}
+
+private enum PureSwiftSHA256 {
+    private static let constants: [UInt32] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ]
+
+    static func hash(_ input: [UInt8]) -> [UInt8] {
+        var bytes = input
+        let bitLength = UInt64(bytes.count) * 8
+        bytes.append(0x80)
+        while bytes.count % 64 != 56 {
+            bytes.append(0)
+        }
+        bytes += stride(from: 56, through: 0, by: -8).map { UInt8((bitLength >> UInt64($0)) & 0xff) }
+
+        var h0: UInt32 = 0x6a09e667
+        var h1: UInt32 = 0xbb67ae85
+        var h2: UInt32 = 0x3c6ef372
+        var h3: UInt32 = 0xa54ff53a
+        var h4: UInt32 = 0x510e527f
+        var h5: UInt32 = 0x9b05688c
+        var h6: UInt32 = 0x1f83d9ab
+        var h7: UInt32 = 0x5be0cd19
+
+        for chunkStart in stride(from: 0, to: bytes.count, by: 64) {
+            var w = Array(repeating: UInt32(0), count: 64)
+            for i in 0..<16 {
+                let j = chunkStart + i * 4
+                w[i] = (UInt32(bytes[j]) << 24)
+                    | (UInt32(bytes[j + 1]) << 16)
+                    | (UInt32(bytes[j + 2]) << 8)
+                    | UInt32(bytes[j + 3])
+            }
+            for i in 16..<64 {
+                let s0 = rotateRight(w[i - 15], by: 7) ^ rotateRight(w[i - 15], by: 18) ^ (w[i - 15] >> 3)
+                let s1 = rotateRight(w[i - 2], by: 17) ^ rotateRight(w[i - 2], by: 19) ^ (w[i - 2] >> 10)
+                w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
+            }
+
+            var a = h0
+            var b = h1
+            var c = h2
+            var d = h3
+            var e = h4
+            var f = h5
+            var g = h6
+            var h = h7
+
+            for i in 0..<64 {
+                let s1 = rotateRight(e, by: 6) ^ rotateRight(e, by: 11) ^ rotateRight(e, by: 25)
+                let ch = (e & f) ^ (~e & g)
+                let temp1 = h &+ s1 &+ ch &+ constants[i] &+ w[i]
+                let s0 = rotateRight(a, by: 2) ^ rotateRight(a, by: 13) ^ rotateRight(a, by: 22)
+                let maj = (a & b) ^ (a & c) ^ (b & c)
+                let temp2 = s0 &+ maj
+
+                h = g
+                g = f
+                f = e
+                e = d &+ temp1
+                d = c
+                c = b
+                b = a
+                a = temp1 &+ temp2
+            }
+
+            h0 = h0 &+ a
+            h1 = h1 &+ b
+            h2 = h2 &+ c
+            h3 = h3 &+ d
+            h4 = h4 &+ e
+            h5 = h5 &+ f
+            h6 = h6 &+ g
+            h7 = h7 &+ h
+        }
+
+        var digest: [UInt8] = []
+        digest.reserveCapacity(32)
+        for word in [h0, h1, h2, h3, h4, h5, h6, h7] {
+            digest.append(UInt8((word >> 24) & 0xff))
+            digest.append(UInt8((word >> 16) & 0xff))
+            digest.append(UInt8((word >> 8) & 0xff))
+            digest.append(UInt8(word & 0xff))
+        }
+        return digest
+    }
+
+    private static func rotateRight(_ value: UInt32, by bits: UInt32) -> UInt32 {
+        (value >> bits) | (value << (32 - bits))
+    }
+}
+#endif
 
 public enum ExitCode: Int32 {
     case success = 0
@@ -37,6 +165,7 @@ public protocol DeviceAuthenticator: Sendable {
     func authenticate(reason: String) async throws
 }
 
+#if canImport(LocalAuthentication)
 public final class LocalDeviceAuthenticator: DeviceAuthenticator, @unchecked Sendable {
     public init() {}
 
@@ -66,6 +195,15 @@ public final class LocalDeviceAuthenticator: DeviceAuthenticator, @unchecked Sen
         }
     }
 }
+#else
+public final class LocalDeviceAuthenticator: DeviceAuthenticator, @unchecked Sendable {
+    public init() {}
+
+    public func authenticate(reason: String) async throws {
+        throw AegisSecretError.blocked("broker_approval_required: local device authentication is unavailable on this platform.")
+    }
+}
+#endif
 
 public struct SecretListItem: Equatable, Codable, Sendable {
     public let key: String
@@ -96,6 +234,229 @@ public extension SecretStore {
     }
 }
 
+public func defaultSecretStore(environment: [String: String] = ProcessInfo.processInfo.environment) -> any SecretStore {
+    let authority = environment["AEGIS_SECRET_AUTHORITY"]?.trimmedNonEmpty?.lowercased()
+        ?? environment["AEGIS_SECRET_LINUX_AUTHORITY"]?.trimmedNonEmpty?.lowercased()
+
+    if authority == "map-gcp" || authority == "linux-map-gcp" {
+        return LinuxMAPGCPSecretStore(environment: environment)
+    }
+
+    #if os(Linux)
+    if authority == nil {
+        return LinuxMAPGCPSecretStore(environment: environment)
+    }
+    #endif
+
+    return KeychainSecretStore()
+}
+
+public struct LinuxMAPGCPCommandResult: Equatable, Sendable {
+    public let stdout: Data
+    public let stderr: Data
+    public let exitCode: Int32
+
+    public init(stdout: Data, stderr: Data, exitCode: Int32) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exitCode = exitCode
+    }
+}
+
+public protocol LinuxMAPGCPCommandExecuting: Sendable {
+    func execute(executable: String, arguments: [String], environment: [String: String]) throws -> LinuxMAPGCPCommandResult
+}
+
+public struct ProcessLinuxMAPGCPCommandExecutor: LinuxMAPGCPCommandExecuting {
+    public init() {}
+
+    public func execute(executable: String, arguments: [String], environment: [String: String]) throws -> LinuxMAPGCPCommandResult {
+        let process = Process()
+        process.executableURL = resolveExecutable(executable, environment: environment)
+        process.arguments = arguments
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        return LinuxMAPGCPCommandResult(
+            stdout: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
+            stderr: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            exitCode: process.terminationStatus
+        )
+    }
+
+    private func resolveExecutable(_ executable: String, environment: [String: String]) -> URL {
+        if executable.contains("/") {
+            return URL(fileURLWithPath: expandUserPath(executable))
+        }
+        for component in (environment["PATH"] ?? "").split(separator: ":") {
+            let candidate = URL(fileURLWithPath: String(component), isDirectory: true)
+                .appendingPathComponent(executable)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return URL(fileURLWithPath: executable)
+    }
+}
+
+public struct LinuxMAPGCPSecretStore: SecretStore {
+    public let projectID: String?
+    public let secretPrefix: String
+    public let gcloudExecutable: String
+    public let mapAccount: String?
+    public let environment: [String: String]
+    public let executor: any LinuxMAPGCPCommandExecuting
+
+    public init(
+        projectID: String? = nil,
+        secretPrefix: String? = nil,
+        gcloudExecutable: String? = nil,
+        mapAccount: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        executor: any LinuxMAPGCPCommandExecuting = ProcessLinuxMAPGCPCommandExecutor()
+    ) {
+        self.projectID = projectID?.trimmedNonEmpty
+            ?? environment["AEGIS_SECRET_GCP_PROJECT"]?.trimmedNonEmpty
+            ?? environment["GOOGLE_CLOUD_PROJECT"]?.trimmedNonEmpty
+        self.secretPrefix = secretPrefix
+            ?? environment["AEGIS_SECRET_GCP_SECRET_PREFIX"]?.trimmedNonEmpty
+            ?? ""
+        self.gcloudExecutable = gcloudExecutable?.trimmedNonEmpty
+            ?? environment["AEGIS_SECRET_GCLOUD"]?.trimmedNonEmpty
+            ?? "gcloud"
+        self.mapAccount = mapAccount?.trimmedNonEmpty
+            ?? environment["AEGIS_SECRET_MAP_ACCOUNT"]?.trimmedNonEmpty
+        self.environment = environment
+        self.executor = executor
+    }
+
+    public func setSecret(_ secretData: Data, for key: String) throws {
+        throw rawCRUDUnavailable()
+    }
+
+    public func readSecret(for key: String) throws -> Data {
+        try readSecret(for: key, reason: "Allow Aegis Broker to materialize a MAP/GCP credential.")
+    }
+
+    public func readSecret(for key: String, reason: String) throws -> Data {
+        let project = try resolvedProjectID()
+        let secretID = try resolvedSecretID(for: key)
+        try requireMAPAuthentication()
+
+        let result: LinuxMAPGCPCommandResult
+        do {
+            result = try executor.execute(
+                executable: gcloudExecutable,
+                arguments: [
+                    "secrets", "versions", "access", "latest",
+                    "--project", project,
+                    "--secret", secretID,
+                ],
+                environment: environment
+            )
+        } catch {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: GCP Secret Manager/KMS authority is unavailable.")
+        }
+
+        guard result.exitCode == 0 else {
+            throw mappedGCPReadFailure(stderr: result.stderr)
+        }
+        guard !result.stdout.isEmpty else {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
+        }
+        return result.stdout
+    }
+
+    public func deleteSecret(for key: String) throws -> Bool {
+        throw rawCRUDUnavailable()
+    }
+
+    public func listSecrets() throws -> [SecretListItem] {
+        throw rawCRUDUnavailable()
+    }
+
+    public func secretExists(for key: String) throws -> Bool {
+        throw rawCRUDUnavailable()
+    }
+
+    private func resolvedProjectID() throws -> String {
+        guard let projectID else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: Linux MAP/GCP authority requires AEGIS_SECRET_GCP_PROJECT or GOOGLE_CLOUD_PROJECT.")
+        }
+        return projectID
+    }
+
+    private func resolvedSecretID(for key: String) throws -> String {
+        let secretID = secretPrefix + key
+        guard isSafeGCPSecretID(secretID) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: credential ref is unsafe for MAP/GCP authority.")
+        }
+        return secretID
+    }
+
+    private func requireMAPAuthentication() throws {
+        if mapAccount != nil {
+            return
+        }
+
+        let result: LinuxMAPGCPCommandResult
+        do {
+            result = try executor.execute(
+                executable: gcloudExecutable,
+                arguments: ["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"],
+                environment: environment
+            )
+        } catch {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: MAP sign-in is required on Linux.")
+        }
+
+        guard result.exitCode == 0,
+              String(data: result.stdout, encoding: .utf8)?.trimmedNonEmpty != nil else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: MAP sign-in is required on Linux.")
+        }
+    }
+
+    private func mappedGCPReadFailure(stderr: Data) -> AegisSecretError {
+        let text = String(data: stderr, encoding: .utf8)?.uppercased() ?? ""
+        if text.contains("PERMISSION_DENIED") || text.contains("403") {
+            return .blocked("broker_credential_materialization_failed: MAP/GCP IAM denied credential ref.")
+        }
+        if text.contains("NOT_FOUND") || text.contains("404") {
+            return .blocked("broker_credential_materialization_failed: MAP/GCP credential ref was denied or missing.")
+        }
+        if text.contains("KMS") || text.contains("UNAVAILABLE") || text.contains("DEADLINE_EXCEEDED") || text.contains("TIMEOUT") {
+            return .blocked("broker_credential_materialization_failed: GCP Secret Manager/KMS authority is unavailable.")
+        }
+        return .blocked("broker_credential_materialization_failed: credential material was unavailable.")
+    }
+
+    private func rawCRUDUnavailable() -> AegisSecretError {
+        AegisSecretError.blocked("raw_secret_crud_unavailable: Linux Broker authority only resolves broker refs through MAP/GCP; raw secret CRUD is not implemented.")
+    }
+
+    private func isSafeGCPSecretID(_ value: String) -> Bool {
+        guard !value.isEmpty else {
+            return false
+        }
+        return value.unicodeScalars.allSatisfy { scalar in
+            (48...57).contains(scalar.value)
+                || (65...90).contains(scalar.value)
+                || (97...122).contains(scalar.value)
+                || scalar.value == 95
+                || scalar.value == 45
+        }
+    }
+}
+
+#if canImport(Security) && canImport(LocalAuthentication)
 public struct KeychainSecretStore: SecretStore {
     public let serviceName: String
     public let metadataServiceName: String
@@ -380,6 +741,48 @@ public struct KeychainSecretStore: SecretStore {
         return "Unable to retrieve secret `\(key)`: \(message(for: status))."
     }
 }
+#else
+public struct KeychainSecretStore: SecretStore {
+    public let serviceName: String
+    public let metadataServiceName: String
+
+    public init(
+        serviceName: String = aegisSecretServiceName,
+        metadataServiceName: String = aegisSecretMetadataServiceName
+    ) {
+        self.serviceName = serviceName
+        self.metadataServiceName = metadataServiceName
+    }
+
+    public func setSecret(_ secretData: Data, for key: String) throws {
+        throw unavailable()
+    }
+
+    public func readSecret(for key: String) throws -> Data {
+        throw unavailable()
+    }
+
+    public func readSecret(for key: String, reason: String) throws -> Data {
+        throw unavailable()
+    }
+
+    public func deleteSecret(for key: String) throws -> Bool {
+        throw unavailable()
+    }
+
+    public func listSecrets() throws -> [SecretListItem] {
+        throw unavailable()
+    }
+
+    public func secretExists(for key: String) throws -> Bool {
+        throw unavailable()
+    }
+
+    private func unavailable() -> AegisSecretError {
+        AegisSecretError.blocked("keychain_unavailable: macOS Keychain-backed raw secret storage is unavailable on this platform.")
+    }
+}
+#endif
 
 public struct WrappedCommandConfig: Codable, Equatable, Sendable {
     public let name: String
@@ -1376,7 +1779,7 @@ public actor ApprovalCache {
         guard ProcessInfo.processInfo.environment["AEGIS_SECRET_DEBUG"] == "1" else {
             return
         }
-        fputs("[aegis-secret] \(message)\n", stderr)
+        writeStandardError("[aegis-secret] \(message)\n")
     }
 }
 
@@ -1485,15 +1888,12 @@ public final class ProcessCommandExecutor: CommandExecutor, @unchecked Sendable 
         label: String,
         commandName: String
     ) async throws -> Data {
-        var data = Data()
-        for try await byte in handle.bytes {
-            if data.count >= maxBytes {
-                if process.isRunning {
-                    process.terminate()
-                }
-                throw AegisSecretError.runtime("Command `\(commandName)` exceeded the \(maxBytes)-byte \(label) limit.")
+        let data = handle.readDataToEndOfFile()
+        if data.count > maxBytes {
+            if process.isRunning {
+                process.terminate()
             }
-            data.append(byte)
+            throw AegisSecretError.runtime("Command `\(commandName)` exceeded the \(maxBytes)-byte \(label) limit.")
         }
         return data
     }
@@ -1941,6 +2341,10 @@ public struct SecretStoreRemoteAuthorityLeaseProvider: RemoteAuthorityLeaseProvi
         let tokenData: Data
         do {
             tokenData = try secretStore.readSecret(for: secretKey, reason: reason)
+        } catch let error as AegisSecretError
+            where error.description.hasPrefix("broker_auth_lease_denied:")
+                || error.description.hasPrefix("broker_credential_materialization_failed:") {
+            throw error
         } catch {
             throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
         }
@@ -2903,6 +3307,10 @@ public struct SecretStoreCLIProfileLeaseProvider: RemoteAuthorityCLIProfileLease
         let tokenData: Data
         do {
             tokenData = try secretStore.readSecret(for: secretKey, reason: reason)
+        } catch let error as AegisSecretError
+            where error.description.hasPrefix("broker_auth_lease_denied:")
+                || error.description.hasPrefix("broker_credential_materialization_failed:") {
+            throw error
         } catch {
             throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
         }
@@ -4865,7 +5273,7 @@ public struct CLIApplication {
 
     public init(
         parser: CommandParser = CommandParser(),
-        secretStore: SecretStore = KeychainSecretStore(),
+        secretStore: SecretStore = defaultSecretStore(),
         authenticator: DeviceAuthenticator = LocalDeviceAuthenticator(),
         commandStore: CommandStore = CommandStore(),
         wrappedCommandRunner: WrappedCommandRunner? = nil,
@@ -5121,7 +5529,7 @@ public struct CLIApplication {
             return FileHandle.standardInput.readDataToEndOfFile()
         case .prompt:
             print("Enter secret: ", terminator: "")
-            fflush(stdout)
+            flushStandardOutput()
 
             guard let secret = readPassword() else {
                 print("")
@@ -5139,13 +5547,13 @@ public struct CLIApplication {
     private func emit(error: AegisSecretError) -> Never {
         switch error {
         case .usage:
-            fputs("Error: \(error.description)\n\n\(usageText)\n", stderr)
+            writeStandardError("Error: \(error.description)\n\n\(usageText)\n")
             exit(ExitCode.usage.rawValue)
         case .blocked:
-            fputs("\(error.description)\n", stderr)
+            writeStandardError("\(error.description)\n")
             exit(ExitCode.blocked.rawValue)
         case .runtime:
-            fputs("Error: \(error.description)\n", stderr)
+            writeStandardError("Error: \(error.description)\n")
             exit(ExitCode.failure.rawValue)
         }
     }
@@ -5699,12 +6107,22 @@ public func readPassword() -> String? {
     return readLine()
 }
 
+func writeStandardError(_ message: String) {
+    FileHandle.standardError.write(Data(message.utf8))
+}
+
+func flushStandardOutput() {
+    fflush(nil)
+}
+
+#if canImport(Security)
 public func message(for status: OSStatus) -> String {
     if let text = SecCopyErrorMessageString(status, nil) as String? {
         return text
     }
     return "OSStatus \(status)"
 }
+#endif
 
 public func prettyJSON<T: Encodable>(_ value: T) throws -> Data {
     let encoder = JSONEncoder()

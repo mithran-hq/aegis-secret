@@ -1,5 +1,10 @@
 import AegisSecretCore
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 @main
 struct AegisSecretCLIEntryPoint {

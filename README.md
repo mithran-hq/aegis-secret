@@ -6,10 +6,15 @@ Aegis Secret stores local secrets in the macOS Keychain with biometric approval.
 Aegis Broker is the protected-tool alias that gates selected privileged actions
 without making ordinary commands go through MCP by default.
 
+On Linux developer hosts, Aegis Broker can use the MAP/GCP authority instead of
+Keychain. In that mode, brokered actions resolve scoped credential refs through
+MAP sign-in and GCP Secret Manager, while raw secret CLI CRUD stays unavailable.
+See `docs/linux-map-gcp-broker-authority.md`.
+
 Aegis sits between the agent and protected local CLI actions:
 
 - the agent sees a small Broker MCP surface for privileged actions
-- Aegis prompts for Touch ID
+- Aegis uses the platform authority for credential materialization
 - Aegis runs the real local command directly when brokered execution is required
 - the agent gets the command result, not a raw secret
 
