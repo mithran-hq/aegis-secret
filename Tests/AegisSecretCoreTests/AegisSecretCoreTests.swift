@@ -1956,6 +1956,40 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertTrue(result.message.contains("Stop and add closure evidence."))
     }
 
+    func testShellGuardExplainsMissingMachineReadableEvidenceRef() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            BrunoGuardDecision(
+                decision: "deny",
+                recommendedNextPrompt: "Stop and add closure evidence."
+            )
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret --comment 'Evidence verified: state valid errors none'")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("No machine-readable evidence reference"))
+        XCTAssertTrue(result.message.contains("artifact://"))
+        XCTAssertTrue(result.message.contains("evidence://"))
+    }
+
+    func testShellGuardDoesNotAddEvidenceRefHintWhenRefIsPresent() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            BrunoGuardDecision(
+                decision: "deny",
+                recommendedNextPrompt: "Stop and add closure evidence."
+            )
+        })
+
+        let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret --comment 'Evidence: evidence://local/aegis/evidence-verify'")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertFalse(result.message.contains("No machine-readable evidence reference"))
+    }
+
     func testShellGuardAllowsProtectedGhMutationWhenBrunoAllows() async {
         let guarder = ShellBypassGuard(wrappedCommands: [
             ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])

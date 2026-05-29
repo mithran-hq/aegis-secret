@@ -4228,7 +4228,7 @@ public struct ShellBypassGuard: Sendable {
             if decision.decision != "allow" {
                 return ShellGuardResult(
                     allowed: false,
-                    message: "Blocked protected GitHub mutation `\(commandName) \(redactedArguments(args).joined(separator: " "))`: \(brunoMessage(from: decision))"
+                    message: "Blocked protected GitHub mutation `\(commandName) \(redactedArguments(args).joined(separator: " "))`: \(brunoMessage(from: decision, mutation: mutation))"
                 )
             }
             return ShellGuardResult(allowed: true)
@@ -4240,17 +4240,25 @@ public struct ShellBypassGuard: Sendable {
         }
     }
 
-    private func brunoMessage(from decision: BrunoGuardDecision) -> String {
+    private func brunoMessage(from decision: BrunoGuardDecision, mutation: ProtectedGitHubMutation? = nil) -> String {
+        let suffix = missingEvidenceRefHint(for: mutation)
         if let prompt = decision.recommendedNextPrompt?.trimmedNonEmpty {
-            return prompt
+            return prompt + suffix
         }
         if let reason = decision.reasons.first?.message.trimmedNonEmpty {
-            return reason
+            return reason + suffix
         }
         if let evidence = decision.requiredEvidence.first {
-            return "Required evidence: \(evidence)."
+            return "Required evidence: \(evidence)." + suffix
         }
-        return "Bruno denied the protected mutation."
+        return "Bruno denied the protected mutation." + suffix
+    }
+
+    private func missingEvidenceRefHint(for mutation: ProtectedGitHubMutation?) -> String {
+        guard let mutation, mutation.evidenceRefs.isEmpty else {
+            return ""
+        }
+        return " No machine-readable evidence reference was found in the protected command. Include an `artifact://...` or `evidence://...` reference in the close/edit comment or body after verification."
     }
 
     private func errorDescription(_ error: Error) -> String {
