@@ -1823,6 +1823,38 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertTrue(result.allowed)
     }
 
+    func testShellGuardAllowsProtectedGhHelpInvocations() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            XCTFail("Bruno should not run for help output")
+            return BrunoGuardDecision(decision: "deny")
+        })
+
+        let issueLongHelp = await guarder.evaluate(command: "gh issue edit --help")
+        let issueShortHelp = await guarder.evaluate(command: "gh issue edit -h")
+        let prHelp = await guarder.evaluate(command: "gh pr merge --help")
+        let apiHelp = await guarder.evaluate(command: "gh api --help")
+
+        XCTAssertTrue(issueLongHelp.allowed)
+        XCTAssertTrue(issueShortHelp.allowed)
+        XCTAssertTrue(prHelp.allowed)
+        XCTAssertTrue(apiHelp.allowed)
+    }
+
+    func testShellGuardAllowsAegisRunProtectedGhHelpInvocation() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            XCTFail("Bruno should not run for help output")
+            return BrunoGuardDecision(decision: "deny")
+        })
+
+        let result = await guarder.evaluate(command: "aegis-secret run gh -- issue edit --help")
+
+        XCTAssertTrue(result.allowed)
+    }
+
     func testShellGuardBlocksBrokerRequiredWrappedCommand() async {
         let result = await ShellBypassGuard(wrappedCommands: [
             ShellGuardWrappedCommand(name: "terraform", brokerRequiredPrefixes: [["apply"]])
@@ -1943,6 +1975,74 @@ final class AegisSecretCoreTests: XCTestCase {
         let result = await guarder.evaluate(command: "gh issue close 17 --repo mithran-hq/aegis-secret --comment 'Evidence artifact://local/smoke'")
 
         XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardRoutesMutatingGhAPIThroughBruno() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { event in
+            guard case .object(let root) = event,
+                  case .object(let action)? = root["action"],
+                  case .object(let subjectRefs)? = root["subject_refs"] else {
+                XCTFail("expected protected gh api event")
+                return BrunoGuardDecision(decision: "deny")
+            }
+            XCTAssertEqual(action["kind"], .string("github.issue.edit"))
+            XCTAssertEqual(subjectRefs["repo"], .string("github://mithran-hq/aegis-secret"))
+            XCTAssertEqual(subjectRefs["issue"], .string("github://mithran-hq/aegis-secret/issues/123"))
+            return BrunoGuardDecision(decision: "deny", recommendedNextPrompt: "Use typed Broker action.")
+        })
+
+        let result = await guarder.evaluate(command: "gh api -X PATCH repos/mithran-hq/aegis-secret/issues/123 -f title=x")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Use typed Broker action."))
+    }
+
+    func testShellGuardRoutesImplicitPostGhAPIThroughBruno() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { event in
+            guard case .object(let root) = event,
+                  case .object(let action)? = root["action"] else {
+                XCTFail("expected protected gh api event")
+                return BrunoGuardDecision(decision: "deny")
+            }
+            XCTAssertEqual(action["kind"], .string("github.issue.edit"))
+            return BrunoGuardDecision(decision: "deny", recommendedNextPrompt: "Use typed Broker action.")
+        })
+
+        let result = await guarder.evaluate(command: "gh api repos/mithran-hq/aegis-secret/issues/123/comments -f body=x")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Use typed Broker action."))
+    }
+
+    func testShellGuardAllowsExplicitGetGhAPIWithFields() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            XCTFail("Bruno should not run for explicit GET")
+            return BrunoGuardDecision(decision: "deny")
+        })
+
+        let result = await guarder.evaluate(command: "gh api -X GET repos/mithran-hq/aegis-secret/issues/123 -f per_page=1")
+
+        XCTAssertTrue(result.allowed)
+    }
+
+    func testShellGuardBlocksGenericMutatingGhAPIWithoutRouteAround() async {
+        let guarder = ShellBypassGuard(wrappedCommands: [
+            ShellGuardWrappedCommand(name: "gh", denyPrefixes: [["auth"]])
+        ], brunoEvaluator: StubBrunoGuardEvaluator { _ in
+            XCTFail("generic gh api mutations should block before Bruno")
+            return BrunoGuardDecision(decision: "allow")
+        })
+
+        let result = await guarder.evaluate(command: "gh api -X DELETE repos/mithran-hq/aegis-secret/git/refs/heads/tmp")
+
+        XCTAssertFalse(result.allowed)
+        XCTAssertTrue(result.message.contains("Blocked mutating GitHub API call"))
     }
 
     func testShellGuardBlocksDirectGhPRMergeThroughBrokerRemoteAction() async {

@@ -4162,6 +4162,9 @@ public struct ShellBypassGuard: Sendable {
 
             let executableName = lastPathComponent(tokens[executableIndex])
             let args = Array(tokens.dropFirst(executableIndex + 1))
+            if isHelpInvocation(args) {
+                continue
+            }
             if executableName == "gh", let protected = protectedGitHubMutation(args: args) {
                 return await evaluateProtectedGitHubMutation(protected, commandName: executableName, args: args)
             }
@@ -4180,6 +4183,9 @@ public struct ShellBypassGuard: Sendable {
                wrappedCommands[tokens[executableIndex + 2]] != nil {
                 let commandName = tokens[executableIndex + 2]
                 let passthroughArgs = passthroughRunArguments(tokens: tokens, start: executableIndex + 3)
+                if isHelpInvocation(passthroughArgs) {
+                    continue
+                }
                 if commandName == "gh", let protected = protectedGitHubMutation(args: passthroughArgs) {
                     return await evaluateProtectedGitHubMutation(protected, commandName: commandName, args: passthroughArgs)
                 }
@@ -4204,6 +4210,12 @@ public struct ShellBypassGuard: Sendable {
             return ShellGuardResult(
                 allowed: false,
                 message: "Blocked direct PR merge `\(commandName) \(redactedArguments(args).joined(separator: " "))`: use Aegis Broker MCP `run_remote_action` with `github.pr.merge` so Broker can derive and enforce `git config user.email`."
+            )
+        }
+        if mutation.kind == "github.api.mutate" {
+            return ShellGuardResult(
+                allowed: false,
+                message: "Blocked mutating GitHub API call `\(commandName) \(redactedArguments(args).joined(separator: " "))`: use a typed Aegis Broker MCP remote action or a supported `gh` subcommand so Bruno can review the mutation."
             )
         }
 
@@ -4291,6 +4303,10 @@ public struct ShellBypassGuard: Sendable {
         let evidenceRefs: [JSONValue]
     }
 
+    private func isHelpInvocation(_ args: [String]) -> Bool {
+        args.contains { $0 == "--help" || $0 == "-h" }
+    }
+
     private func protectedGitHubMutation(args: [String]) -> ProtectedGitHubMutation? {
         guard args.count >= 2 else {
             return nil
@@ -4299,6 +4315,12 @@ public struct ShellBypassGuard: Sendable {
         let normalizedArgs = args.first == "gh" ? Array(args.dropFirst()) : args
         guard normalizedArgs.count >= 2 else {
             return nil
+        }
+        if isHelpInvocation(normalizedArgs) {
+            return nil
+        }
+        if normalizedArgs.first == "api" {
+            return protectedGitHubAPIMutation(args: normalizedArgs)
         }
 
         let scope = normalizedArgs[0]
@@ -4326,6 +4348,163 @@ public struct ShellBypassGuard: Sendable {
         default:
             return nil
         }
+    }
+
+    private func protectedGitHubAPIMutation(args: [String]) -> ProtectedGitHubMutation? {
+        guard let endpoint = githubAPIEndpoint(in: args) else {
+            return nil
+        }
+        let method = githubAPIMethod(args: args).uppercased()
+        guard ["POST", "PATCH", "PUT", "DELETE"].contains(method) else {
+            return nil
+        }
+        guard githubAPIEndpointIsProtected(endpoint, args: args) else {
+            return nil
+        }
+        let repo = githubAPIRepo(endpoint: endpoint) ?? optionValue(in: args, names: ["--repo", "-R"])
+        return ProtectedGitHubMutation(
+            kind: githubAPIProtectedKind(endpoint: endpoint),
+            target: githubAPITarget(endpoint: endpoint),
+            repo: repo,
+            evidenceRefs: evidenceRefs(in: args)
+        )
+    }
+
+    private func githubAPIEndpoint(in args: [String]) -> String? {
+        var skipNext = false
+        for arg in args.dropFirst() {
+            if skipNext {
+                skipNext = false
+                continue
+            }
+            if githubAPIFlagsWithValue.contains(arg) {
+                skipNext = true
+                continue
+            }
+            if githubAPIFlagsWithInlineValue.contains(where: { arg.hasPrefix($0) }) {
+                continue
+            }
+            if arg.hasPrefix("-") {
+                continue
+            }
+            return arg.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
+        return nil
+    }
+
+    private func githubAPIMethod(args: [String]) -> String {
+        if let explicit = optionValue(in: args, names: ["--method", "-X"])?.trimmedNonEmpty {
+            return explicit
+        }
+        return githubAPIHasRequestBody(args: args) ? "POST" : "GET"
+    }
+
+    private func githubAPIHasRequestBody(args: [String]) -> Bool {
+        args.contains { arg in
+            arg == "-f" || arg == "--raw-field" || arg.hasPrefix("-f=") || arg.hasPrefix("--raw-field=")
+                || arg == "-F" || arg == "--field" || arg.hasPrefix("-F=") || arg.hasPrefix("--field=")
+                || arg == "--input" || arg.hasPrefix("--input=")
+        }
+    }
+
+    private func githubAPIEndpointIsProtected(_ endpoint: String, args: [String]) -> Bool {
+        if endpoint == "graphql" {
+            return githubAPIGraphQLLooksMutating(args: args)
+        }
+        return githubAPIEndpointMatchesProtectedSurface(endpoint)
+    }
+
+    private func githubAPIProtectedKind(endpoint: String) -> String {
+        let lower = endpoint.lowercased()
+        if lower.contains("/issues/") || lower.contains("/comments") || lower.contains("/labels") {
+            return "github.issue.edit"
+        }
+        if lower.contains("/pulls/") {
+            return "github.pr.edit"
+        }
+        if lower.contains("/releases") {
+            return "github.release.edit"
+        }
+        if lower.contains("/git/refs") || lower.contains("/branches") {
+            return "github.api.mutate"
+        }
+        if lower == "graphql" {
+            return "github.api.mutate"
+        }
+        return "github.api.mutate"
+    }
+
+    private func githubAPIEndpointMatchesProtectedSurface(_ endpoint: String) -> Bool {
+        let lower = endpoint.lowercased()
+        return lower.contains("/issues/")
+            || lower.contains("/pulls/")
+            || lower.contains("/releases")
+            || lower.contains("/comments")
+            || lower.contains("/labels")
+            || lower.contains("/git/refs")
+            || lower.contains("/branches")
+    }
+
+    private func githubAPIGraphQLLooksMutating(args: [String]) -> Bool {
+        for value in githubAPIFieldValues(named: "query", args: args) {
+            if value.lowercased().contains("mutation") {
+                return true
+            }
+        }
+        return optionValue(in: args, names: ["--input"]) != nil
+    }
+
+    private func githubAPIFieldValues(named name: String, args: [String]) -> [String] {
+        var values: [String] = []
+        var captureNext = false
+        for arg in args {
+            if captureNext {
+                if let equals = arg.firstIndex(of: "="),
+                   String(arg[..<equals]) == name {
+                    values.append(String(arg[arg.index(after: equals)...]))
+                }
+                captureNext = false
+                continue
+            }
+            if ["-f", "--raw-field", "-F", "--field"].contains(arg) {
+                captureNext = true
+                continue
+            }
+            for prefix in ["-f=", "--raw-field=", "-F=", "--field="] where arg.hasPrefix(prefix) {
+                let field = String(arg.dropFirst(prefix.count))
+                if let equals = field.firstIndex(of: "="),
+                   String(field[..<equals]) == name {
+                    values.append(String(field[field.index(after: equals)...]))
+                }
+            }
+        }
+        return values
+    }
+
+    private func githubAPIRepo(endpoint: String) -> String? {
+        let parts = endpoint.split(separator: "/").map(String.init)
+        guard parts.count >= 3, parts[0] == "repos" else {
+            return nil
+        }
+        return "\(parts[1])/\(parts[2])"
+    }
+
+    private func githubAPITarget(endpoint: String) -> String? {
+        let parts = endpoint.split(separator: "/").map(String.init)
+        for marker in ["issues", "pulls", "releases"] {
+            if let index = parts.firstIndex(of: marker), parts.indices.contains(index + 1) {
+                return parts[index + 1]
+            }
+        }
+        return nil
+    }
+
+    private var githubAPIFlagsWithValue: Set<String> {
+        ["-F", "--field", "-f", "--raw-field", "-H", "--header", "-q", "--jq", "-t", "--template", "-X", "--method", "--cache", "--hostname", "-p", "--preview", "--input"]
+    }
+
+    private var githubAPIFlagsWithInlineValue: Set<String> {
+        ["-F=", "--field=", "-f=", "--raw-field=", "-H=", "--header=", "-q=", "--jq=", "-t=", "--template=", "-X=", "--method=", "--cache=", "--hostname=", "-p=", "--preview=", "--input="]
     }
 
     private func brunoEvent(for mutation: ProtectedGitHubMutation, commandName: String, args: [String]) -> JSONValue {
