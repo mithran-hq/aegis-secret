@@ -951,7 +951,8 @@ final class AegisSecretCoreTests: XCTestCase {
                     XCTFail("expected Bruno event")
                     return BrunoGuardDecision(decision: "deny")
                 }
-                XCTAssertEqual(action["kind"], .string("github.issue.close"))
+                XCTAssertEqual(root["schema_version"], .string("aegis.broker.remote_authority_bruno_event.v1"))
+                XCTAssertEqual(action["action_id"], .string("github.issue.close"))
                 return BrunoGuardDecision(decision: "deny", recommendedNextPrompt: "Add closure evidence.")
             }
         )
@@ -1009,10 +1010,14 @@ final class AegisSecretCoreTests: XCTestCase {
             },
             brunoEvaluator: StubBrunoGuardEvaluator { event in
                 guard case .object(let root) = event,
-                      case .object(let action)? = root["action"] else {
+                      case .object(let action)? = root["action"],
+                      case .object(let caller)? = root["caller"],
+                      case .object(let subjectRefs)? = root["subject_refs"] else {
                     XCTFail("expected Bruno event")
                     return BrunoGuardDecision(decision: "deny")
                 }
+                XCTAssertEqual(root["schema_version"], .string("aegis.broker.remote_authority_bruno_event.v1"))
+                XCTAssertEqual(action["action_id"], .string("github.pr.merge"))
                 XCTAssertEqual(action["kind"], .string("github.pr.merge"))
                 XCTAssertEqual(action["command"], .string("gh"))
                 XCTAssertEqual(action["argv"], .array([
@@ -1024,6 +1029,15 @@ final class AegisSecretCoreTests: XCTestCase {
                     .string("mithran-hq/aegis-secret"),
                     .string("--merge"),
                 ]))
+                XCTAssertEqual(action["input_schema_ref"], .string("schema://aegis-broker/github.pr.merge.v1"))
+                XCTAssertEqual(action["grant_class"], .string("github_issue_pr_mutation"))
+                XCTAssertEqual(action["credential_class"], .string("github_app_installation_token"))
+                XCTAssertEqual(caller["agent"], .string("Codex"))
+                XCTAssertEqual(caller["session_ref"], .string("agent-session://local/test"))
+                XCTAssertEqual(subjectRefs["project"], .string("project://d79"))
+                XCTAssertEqual(subjectRefs["repo"], .string("github://mithran-hq/aegis-secret"))
+                XCTAssertEqual(subjectRefs["resource"], .string("github://mithran-hq/aegis-secret/pull/42"))
+                XCTAssertEqual(root["intended_mutation_summary"], .string("Run github.pr.merge for github://mithran-hq/aegis-secret/pull/42 through Aegis Broker using supplied evidence refs."))
                 return BrunoGuardDecision(decision: "allow")
             },
             now: { Date(timeIntervalSince1970: 1_000_000) }
@@ -1041,6 +1055,103 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertEqual(result.evidence.authorIdentity?.emailOriginKind, "include")
         XCTAssertFalse(encoded.contains("b@mithran.ai"))
         XCTAssertFalse(encoded.contains("secret-token-123"))
+    }
+
+    func testRemoteAuthorityGitHubPRMergeRealBrunoEvaluatorReceivesRemoteAuthoritySchema() async throws {
+        let tempDirectory = try temporaryDirectory()
+        _ = try makeExecutable(named: "bruno", in: tempDirectory, contents: "#!/bin/sh\nexit 0\n")
+        let evaluator = ProcessBrunoGuardEvaluator(
+            commandStore: CommandStore(
+                fileURL: tempDirectory.appendingPathComponent("commands.json"),
+                environment: ["PATH": tempDirectory.path]
+            ),
+            executor: MockCommandExecutor { request in
+                XCTAssertEqual(request.arguments.first, "guard")
+                guard let fileIndex = request.arguments.firstIndex(of: "--file"),
+                      request.arguments.indices.contains(fileIndex + 1) else {
+                    XCTFail("expected --file argument")
+                    return RawCommandExecutionResult(stdout: Data(), stderr: Data(), exitCode: 2)
+                }
+                let eventData = try Data(contentsOf: URL(fileURLWithPath: request.arguments[fileIndex + 1]))
+                let event = try JSONDecoder().decode(JSONValue.self, from: eventData)
+                guard case .object(let root) = event,
+                      case .object(let action)? = root["action"] else {
+                    XCTFail("expected Bruno event object")
+                    return RawCommandExecutionResult(stdout: Data(), stderr: Data(), exitCode: 2)
+                }
+                XCTAssertEqual(root["schema_version"], .string("aegis.broker.remote_authority_bruno_event.v1"))
+                XCTAssertEqual(action["action_id"], .string("github.pr.merge"))
+                XCTAssertNotEqual(root["schema_version"], .string("aegis.broker.bruno_event.v1"))
+                return RawCommandExecutionResult(
+                    stdout: Data("""
+                    {"decision":"allow","reasons":[],"required_evidence":[]}
+                    """.utf8),
+                    stderr: Data(),
+                    exitCode: 0
+                )
+            }
+        )
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                RemoteAuthorityLease(
+                    authLeaseRef: "auth-lease://github-app/aegis-secret/prs",
+                    grantRef: "auth-grant://github_issue_pr_mutation/aegis-secret",
+                    token: "secret-token-123"
+                )
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                RemoteAuthorityActionOutput(
+                    statusCode: 200,
+                    resourceRef: "github://mithran-hq/aegis-secret/pull/42",
+                    responseSHA256: "sha256:abc123"
+                )
+            },
+            gitIdentityProvider: StubGitAuthorIdentityProvider { _ in
+                GitAuthorIdentity(
+                    email: "b@mithran.ai",
+                    emailOrigin: "file:/Users/brunofr/.gitconfig-mithran\tb@mithran.ai",
+                    remoteOriginURL: "git@github.com:mithran-hq/aegis-secret.git"
+                )
+            },
+            brunoEvaluator: evaluator
+        )
+
+        let result = try await runner.run(RemoteAuthorityActionRequest(
+            actionID: "github.pr.merge",
+            payload: remotePRMergePayload(cwd: "/tmp/aegis-secret"),
+            requester: "Codex"
+        ))
+
+        XCTAssertEqual(result.status, "ok")
+    }
+
+    func testProcessBrunoGuardEvaluatorSurfacesStructuredBrunoError() async throws {
+        let tempDirectory = try temporaryDirectory()
+        _ = try makeExecutable(named: "bruno", in: tempDirectory, contents: "#!/bin/sh\nexit 0\n")
+        let evaluator = ProcessBrunoGuardEvaluator(
+            commandStore: CommandStore(
+                fileURL: tempDirectory.appendingPathComponent("commands.json"),
+                environment: ["PATH": tempDirectory.path]
+            ),
+            executor: MockCommandExecutor { _ in
+                RawCommandExecutionResult(
+                    stdout: Data("""
+                    {"schema_version":"bruno.error.v1","error_type":"input","target":"guard","message":"broker Bruno event command must be gh","ok":false}
+                    """.utf8),
+                    stderr: Data(),
+                    exitCode: 2
+                )
+            }
+        )
+
+        do {
+            _ = try await evaluator.evaluate(event: .object(["schema_version": .string("aegis.broker.bruno_event.v1")]))
+            XCTFail("expected structured Bruno error")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("Bruno guard failed"))
+            XCTAssertTrue(error.description.contains("broker Bruno event command must be gh"))
+            XCTAssertFalse(error.description.contains("malformed output"))
+        }
     }
 
     func testRemoteAuthorityGitHubPRMergeFailsClosedWhenGitEmailMissing() async throws {

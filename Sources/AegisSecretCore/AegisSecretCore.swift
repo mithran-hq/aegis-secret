@@ -2857,34 +2857,45 @@ public struct RemoteAuthorityActionRunner: Sendable {
     ) -> JSONValue {
         let payload = (try? objectPayload(request.payload)) ?? [:]
         var action: [String: JSONValue] = [
+            "action_id": .string(request.actionID),
             "kind": .string(request.actionID),
             "broker_action_ref": .string("broker-action://\(request.actionID)"),
             "bruno_gate_ref": .string(descriptor.brunoGateRef),
+            "credential_class": .string(descriptor.credentialClass),
+            "grant_class": .string(descriptor.grantClass),
+            "input_schema_ref": .string(descriptor.inputSchemaRef),
         ]
         brunoGitHubCommand(actionID: request.actionID, repo: repo, payload: payload).forEach {
             action[$0.key] = $0.value
         }
         let subjectRefs: [String: JSONValue] = [
+            "project": .string(stringValue(payload["project_ref"]) ?? "project://local"),
             "repo": .string("github://\(repo)"),
             "resource": .string(resourceScopeRef),
         ]
-        let actor: [String: JSONValue] = [
+        let caller: [String: JSONValue] = [
             "agent": .string(request.requester?.trimmedNonEmpty ?? "local-agent"),
+            "requester_ref": .string(stringValue(payload["requester_ref"]) ?? "broker://aegis-secret/run_remote_action"),
             "session_ref": .string(stringValue(payload["session_ref"]) ?? "agent-session://local"),
         ]
-        let context: [String: JSONValue] = [
-            "tool_kind": .string("broker_remote_action"),
-            "cwd": .string("[REDACTED_PATH]"),
-        ]
-        return .object([
-            "schema_version": .string("aegis.broker.bruno_event.v1"),
+        var event: [String: JSONValue] = [
+            "schema_version": .string("aegis.broker.remote_authority_bruno_event.v1"),
             "action": .object(action),
             "subject_refs": .object(subjectRefs),
-            "actor": .object(actor),
-            "context": .object(context),
+            "caller": .object(caller),
+            "intended_mutation_summary": .string(
+                stringValue(payload["intended_mutation_summary"])
+                    ?? "Run \(request.actionID) for \(resourceScopeRef) through Aegis Broker using supplied evidence refs."
+            ),
             "redaction_state": .string("metadata_only"),
             "evidence_refs": .array(arrayValue(payload["evidence_refs"]) ?? []),
-        ])
+        ]
+        for key in ["local_verification", "adversarial_review", "verified", "reviewed"] {
+            if let value = payload[key] {
+                event[key] = value
+            }
+        }
+        return .object(event)
     }
 
     private func brunoGitHubCommand(actionID: String, repo: String, payload: [String: JSONValue]) -> [String: JSONValue] {
@@ -4012,6 +4023,18 @@ public struct BrunoGuardDecision: Decodable, Equatable, Sendable {
     }
 }
 
+private struct BrunoGuardErrorPayload: Decodable {
+    let schemaVersion: String
+    let message: String
+    let target: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case message
+        case target
+    }
+}
+
 public protocol BrunoGuardEvaluating: Sendable {
     func evaluate(event: JSONValue) async throws -> BrunoGuardDecision
 }
@@ -4061,16 +4084,35 @@ public struct ProcessBrunoGuardEvaluator: BrunoGuardEvaluating {
             )
         )
 
-        guard let decision = try? JSONDecoder().decode(BrunoGuardDecision.self, from: result.stdout) else {
-            throw AegisSecretError.runtime("Bruno guard returned malformed output.")
+        let decoder = JSONDecoder()
+        if let decision = try? decoder.decode(BrunoGuardDecision.self, from: result.stdout) {
+            if result.exitCode != 0 && result.exitCode != 1 {
+                throw AegisSecretError.runtime("Bruno guard failed with exit code \(result.exitCode): \(brunoFailureContext(stdout: result.stdout, stderr: result.stderr))")
+            }
+            return decision
+        }
+
+        if let error = try? decoder.decode(BrunoGuardErrorPayload.self, from: result.stdout),
+           error.schemaVersion == "bruno.error.v1" {
+            let target = error.target.map { " (\($0))" } ?? ""
+            throw AegisSecretError.runtime("Bruno guard failed\(target): \(error.message)")
         }
 
         if result.exitCode != 0 && result.exitCode != 1 {
-            throw AegisSecretError.runtime("Bruno guard failed with exit code \(result.exitCode).")
+            throw AegisSecretError.runtime("Bruno guard failed with exit code \(result.exitCode): \(brunoFailureContext(stdout: result.stdout, stderr: result.stderr))")
         }
 
-        return decision
+        throw AegisSecretError.runtime("Bruno guard returned malformed output.")
     }
+}
+
+private func brunoFailureContext(stdout: Data, stderr: Data) -> String {
+    let stderrText = String(decoding: stderr, as: UTF8.self).trimmedNonEmpty
+    if let stderrText {
+        return stderrText
+    }
+    let stdoutText = String(decoding: stdout, as: UTF8.self).trimmedNonEmpty
+    return stdoutText ?? "no output"
 }
 
 public struct ShellBypassGuard: Sendable {
