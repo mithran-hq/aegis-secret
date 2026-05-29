@@ -1014,6 +1014,16 @@ final class AegisSecretCoreTests: XCTestCase {
                     return BrunoGuardDecision(decision: "deny")
                 }
                 XCTAssertEqual(action["kind"], .string("github.pr.merge"))
+                XCTAssertEqual(action["command"], .string("gh"))
+                XCTAssertEqual(action["argv"], .array([
+                    .string("gh"),
+                    .string("pr"),
+                    .string("merge"),
+                    .string("42"),
+                    .string("--repo"),
+                    .string("mithran-hq/aegis-secret"),
+                    .string("--merge"),
+                ]))
                 return BrunoGuardDecision(decision: "allow")
             },
             now: { Date(timeIntervalSince1970: 1_000_000) }

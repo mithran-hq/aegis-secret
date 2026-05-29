@@ -2856,11 +2856,14 @@ public struct RemoteAuthorityActionRunner: Sendable {
         resourceScopeRef: String
     ) -> JSONValue {
         let payload = (try? objectPayload(request.payload)) ?? [:]
-        let action: [String: JSONValue] = [
+        var action: [String: JSONValue] = [
             "kind": .string(request.actionID),
             "broker_action_ref": .string("broker-action://\(request.actionID)"),
             "bruno_gate_ref": .string(descriptor.brunoGateRef),
         ]
+        brunoGitHubCommand(actionID: request.actionID, repo: repo, payload: payload).forEach {
+            action[$0.key] = $0.value
+        }
         let subjectRefs: [String: JSONValue] = [
             "repo": .string("github://\(repo)"),
             "resource": .string(resourceScopeRef),
@@ -2882,6 +2885,35 @@ public struct RemoteAuthorityActionRunner: Sendable {
             "redaction_state": .string("metadata_only"),
             "evidence_refs": .array(arrayValue(payload["evidence_refs"]) ?? []),
         ])
+    }
+
+    private func brunoGitHubCommand(actionID: String, repo: String, payload: [String: JSONValue]) -> [String: JSONValue] {
+        let argv: [String]
+        switch actionID {
+        case "github.issue.close":
+            argv = ["gh", "issue", "close", "\(integerValue(payload["issue_number"]) ?? 0)", "--repo", repo]
+        case "github.issue.reopen":
+            argv = ["gh", "issue", "reopen", "\(integerValue(payload["issue_number"]) ?? 0)", "--repo", repo]
+        case "github.pr.merge":
+            var mergeArgv = ["gh", "pr", "merge", "\(integerValue(payload["pr_number"]) ?? 0)", "--repo", repo]
+            switch stringValue(payload["merge_method"]) ?? "merge" {
+            case "rebase":
+                mergeArgv.append("--rebase")
+            case "squash":
+                mergeArgv.append("--squash")
+            default:
+                mergeArgv.append("--merge")
+            }
+            argv = mergeArgv
+        case "github.pr.label":
+            argv = ["gh", "pr", "edit", "\(integerValue(payload["pr_number"]) ?? 0)", "--repo", repo, "--add-label", "[REDACTED]"]
+        default:
+            return [:]
+        }
+        return [
+            "command": .string("gh"),
+            "argv": .array(argv.map { .string($0) }),
+        ]
     }
 }
 
