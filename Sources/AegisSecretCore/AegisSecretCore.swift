@@ -2191,6 +2191,7 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
     public let schemaVersion: String
     public let actionID: String
     public let inputSchemaRef: String
+    public let payloadContract: RemoteAuthorityPayloadContract
     public let grantClass: String
     public let credentialClass: String
     public let policyRef: String
@@ -2205,6 +2206,7 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         schemaVersion: String = "aegis.broker.remote_authority_action.v1",
         actionID: String,
         inputSchemaRef: String,
+        payloadContract: RemoteAuthorityPayloadContract,
         grantClass: String = "github_issue_pr_mutation",
         credentialClass: String = "github_app_installation_token",
         policyRef: String = "aegis-broker-policy://d79/github-typed-actions",
@@ -2218,6 +2220,7 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.actionID = actionID
         self.inputSchemaRef = inputSchemaRef
+        self.payloadContract = payloadContract
         self.grantClass = grantClass
         self.credentialClass = credentialClass
         self.policyRef = policyRef
@@ -2233,6 +2236,7 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         case schemaVersion = "schema_version"
         case actionID = "action_id"
         case inputSchemaRef = "input_schema_ref"
+        case payloadContract = "payload_contract"
         case grantClass = "grant_class"
         case credentialClass = "credential_class"
         case policyRef = "policy_ref"
@@ -2242,6 +2246,36 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         case authLeaseRef = "auth_lease_ref"
         case executionMode = "execution_mode"
         case cleanup
+    }
+}
+
+public struct RemoteAuthorityPayloadContract: Codable, Equatable, Sendable {
+    public let requiredFields: [String]
+    public let optionalFields: [String]
+    public let evidenceFields: [String]
+    public let retryFields: [String]
+    public let retryGuidance: String
+
+    public init(
+        requiredFields: [String],
+        optionalFields: [String],
+        evidenceFields: [String] = [],
+        retryFields: [String] = [],
+        retryGuidance: String
+    ) {
+        self.requiredFields = requiredFields
+        self.optionalFields = optionalFields
+        self.evidenceFields = evidenceFields
+        self.retryFields = retryFields
+        self.retryGuidance = retryGuidance
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case requiredFields = "required_fields"
+        case optionalFields = "optional_fields"
+        case evidenceFields = "evidence_fields"
+        case retryFields = "retry_fields"
+        case retryGuidance = "retry_guidance"
     }
 }
 
@@ -2275,9 +2309,82 @@ public struct RemoteAuthorityActionCatalog: Sendable {
         return RemoteAuthorityActionDescriptor(
             actionID: actionID,
             inputSchemaRef: schema,
+            payloadContract: payloadContract(for: actionID),
             policyHash: policyHash,
             brunoGateRef: bruno
         )
+    }
+
+    private static func payloadContract(for actionID: String) -> RemoteAuthorityPayloadContract {
+        let commonRequired = ["repo", "auth_lease_ref", "grant_ref", "credential_ref"]
+        let commonOptional = ["project_ref", "session_ref", "requester_ref"]
+        let brunoOptional = commonOptional + [
+            "intended_mutation_summary",
+            "evidence_refs",
+            "local_verification",
+            "adversarial_review",
+            "verified",
+            "reviewed",
+        ]
+
+        switch actionID {
+        case "github.issue.comment":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["issue_number", "body"],
+                optionalFields: commonOptional,
+                retryGuidance: "Call `run_remote_action` with the same action id and a comment body. This action is not Bruno-gated."
+            )
+        case "github.issue.close":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["issue_number"],
+                optionalFields: brunoOptional,
+                evidenceFields: ["evidence_refs", "local_verification", "adversarial_review"],
+                retryFields: ["evidence_refs", "local_verification", "adversarial_review", "intended_mutation_summary"],
+                retryGuidance: "If Bruno denies the close, gather closure evidence and retry the same `run_remote_action` with `evidence_refs`, `local_verification`, `adversarial_review`, and `intended_mutation_summary` in the payload."
+            )
+        case "github.issue.reopen":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["issue_number"],
+                optionalFields: brunoOptional,
+                evidenceFields: ["evidence_refs"],
+                retryFields: ["evidence_refs", "intended_mutation_summary"],
+                retryGuidance: "If Bruno denies the reopen, gather mutation evidence and retry the same `run_remote_action` with `evidence_refs` and `intended_mutation_summary` in the payload."
+            )
+        case "github.pr.comment":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["pr_number", "body"],
+                optionalFields: commonOptional,
+                retryGuidance: "Call `run_remote_action` with the same action id and a PR comment body. This action is not Bruno-gated."
+            )
+        case "github.pr.merge":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["pr_number", "cwd"],
+                optionalFields: brunoOptional + [
+                    "merge_method",
+                    "delete_branch",
+                    "expected_head_oid",
+                    "commit_headline",
+                    "commit_body",
+                ],
+                evidenceFields: ["evidence_refs", "local_verification", "adversarial_review", "expected_head_oid"],
+                retryFields: ["evidence_refs", "local_verification", "adversarial_review", "expected_head_oid", "intended_mutation_summary"],
+                retryGuidance: "If Bruno denies the merge, gather PR checks/review/head evidence and retry the same `run_remote_action` with `evidence_refs`, `local_verification`, `adversarial_review`, `expected_head_oid`, and `intended_mutation_summary` in the payload. Do not inspect Bruno, Aegis binaries, or approval status unless the error says Bruno is unavailable."
+            )
+        case "github.pr.label":
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired + ["pr_number", "labels"],
+                optionalFields: brunoOptional,
+                evidenceFields: ["evidence_refs"],
+                retryFields: ["evidence_refs", "intended_mutation_summary"],
+                retryGuidance: "If Bruno denies the label mutation, gather mutation evidence and retry the same `run_remote_action` with `evidence_refs` and `intended_mutation_summary` in the payload."
+            )
+        default:
+            return RemoteAuthorityPayloadContract(
+                requiredFields: commonRequired,
+                optionalFields: commonOptional,
+                retryGuidance: "Call `list_remote_actions` for the supported payload contract before retrying."
+            )
+        }
     }
 }
 
@@ -2844,9 +2951,23 @@ public struct RemoteAuthorityActionRunner: Sendable {
             resourceScopeRef: resourceScopeRef
         ))
         guard decision.decision == "allow" else {
-            throw AegisSecretError.blocked("broker_bruno_denied: \(decision.recommendedNextPrompt ?? decision.reasons.first?.message ?? "Bruno denied the action.").")
+            throw AegisSecretError.blocked("broker_bruno_denied: \(brunoDeniedMessage(decision: decision, descriptor: descriptor))")
         }
         return "bruno-decision://\(descriptor.actionID)/\(sha256Hex(Data("\(repo):\(resourceScopeRef)".utf8)))"
+    }
+
+    private func brunoDeniedMessage(
+        decision: BrunoGuardDecision,
+        descriptor: RemoteAuthorityActionDescriptor
+    ) -> String {
+        let base = decision.recommendedNextPrompt
+            ?? decision.reasons.first?.message
+            ?? "Bruno denied the action."
+        let retryFields = descriptor.payloadContract.retryFields
+        guard !retryFields.isEmpty else {
+            return "\(base) \(descriptor.payloadContract.retryGuidance)"
+        }
+        return "\(base) Retry Aegis Broker MCP `run_remote_action` for `\(descriptor.actionID)` with payload fields: \(retryFields.joined(separator: ", ")). \(descriptor.payloadContract.retryGuidance)"
     }
 
     private func brunoEvent(

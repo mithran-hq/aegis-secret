@@ -970,6 +970,81 @@ final class AegisSecretCoreTests: XCTestCase {
         }
     }
 
+    func testRemoteAuthorityActionCatalogDescribesPRMergeEvidenceContract() throws {
+        let descriptor = try RemoteAuthorityActionCatalog().descriptor(actionID: "github.pr.merge")
+
+        XCTAssertEqual(descriptor.payloadContract.requiredFields, [
+            "repo",
+            "auth_lease_ref",
+            "grant_ref",
+            "credential_ref",
+            "pr_number",
+            "cwd",
+        ])
+        XCTAssertTrue(descriptor.payloadContract.optionalFields.contains("expected_head_oid"))
+        XCTAssertTrue(descriptor.payloadContract.optionalFields.contains("intended_mutation_summary"))
+        XCTAssertEqual(descriptor.payloadContract.retryFields, [
+            "evidence_refs",
+            "local_verification",
+            "adversarial_review",
+            "expected_head_oid",
+            "intended_mutation_summary",
+        ])
+        XCTAssertTrue(descriptor.payloadContract.retryGuidance.contains("Do not inspect Bruno"))
+    }
+
+    func testRemoteAuthorityGitHubPRMergeDenialExplainsRetryPayload() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                XCTFail("lease should not be requested after Bruno denial")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "auth-grant://unexpected", token: "secret-token-123")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called after Bruno denial")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            gitIdentityProvider: StubGitAuthorIdentityProvider { _ in
+                GitAuthorIdentity(
+                    email: "b@mithran.ai",
+                    emailOrigin: "file:/Users/brunofr/.gitconfig-mithran\tb@mithran.ai",
+                    remoteOriginURL: "git@github.com:mithran-hq/aegis-secret.git"
+                )
+            },
+            brunoEvaluator: StubBrunoGuardEvaluator { event in
+                guard case .object(let root) = event,
+                      case .object(let action)? = root["action"],
+                      case .array(let evidenceRefs)? = root["evidence_refs"] else {
+                    XCTFail("expected Bruno event")
+                    return BrunoGuardDecision(decision: "deny")
+                }
+                XCTAssertEqual(action["action_id"], .string("github.pr.merge"))
+                XCTAssertTrue(evidenceRefs.isEmpty)
+                return BrunoGuardDecision(
+                    decision: "deny",
+                    recommendedNextPrompt: "Stop this action, gather the required evidence, and re-run the guard before finalizing or mutating external state."
+                )
+            }
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.pr.merge",
+                payload: remotePRMergePayload(cwd: "/tmp/aegis-secret", includeEvidence: false),
+                requester: "Codex"
+            ))
+            XCTFail("expected Bruno denial")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_bruno_denied"))
+            XCTAssertTrue(error.description.contains("Retry Aegis Broker MCP `run_remote_action`"))
+            XCTAssertTrue(error.description.contains("evidence_refs"))
+            XCTAssertTrue(error.description.contains("local_verification"))
+            XCTAssertTrue(error.description.contains("adversarial_review"))
+            XCTAssertTrue(error.description.contains("expected_head_oid"))
+            XCTAssertTrue(error.description.contains("intended_mutation_summary"))
+            XCTAssertTrue(error.description.contains("Do not inspect Bruno"))
+        }
+    }
+
     func testRemoteAuthorityGitHubPRMergeUsesGitConfigAuthorEmailForGraphQL() async throws {
         let runner = RemoteAuthorityActionRunner(
             leaseProvider: StubRemoteAuthorityLeaseProvider { request, descriptor in
@@ -2412,8 +2487,8 @@ final class AegisSecretCoreTests: XCTestCase {
         return .object(payload)
     }
 
-    private func remotePRMergePayload(cwd: String) -> JSONValue {
-        .object([
+    private func remotePRMergePayload(cwd: String, includeEvidence: Bool = true) -> JSONValue {
+        var payload: [String: JSONValue] = [
             "repo": .string("mithran-hq/aegis-secret"),
             "pr_number": .integer(42),
             "merge_method": .string("merge"),
@@ -2424,13 +2499,16 @@ final class AegisSecretCoreTests: XCTestCase {
             "auth_lease_ref": .string("auth-lease://github-app/aegis-secret/prs"),
             "grant_ref": .string("auth-grant://github_issue_pr_mutation/aegis-secret"),
             "credential_ref": .string("\(secretEnvironmentReferencePrefix)github-app-token"),
-            "evidence_refs": .array([
+        ]
+        if includeEvidence {
+            payload["evidence_refs"] = .array([
                 .object([
                     "ref": .string("evidence://d79/pr-merge"),
                     "redaction_state": .string("metadata_only"),
                 ])
-            ]),
-        ])
+            ])
+        }
+        return .object(payload)
     }
 
     private func cliProfileRequest(parameters: [String: String], cwd: String?) -> RemoteAuthorityCLIProfileRequest {

@@ -389,7 +389,7 @@ public final class StdioMCPServer {
             ToolDescriptor(
                 name: "list_remote_actions",
                 title: "List brokered remote-authority actions",
-                description: "List the typed GitHub/source-control remote-authority actions that Aegis Broker can run without exposing reusable worker write credentials.",
+                description: "List the typed GitHub/source-control remote-authority actions that Aegis Broker can run without exposing reusable worker write credentials, including each action's payload contract and Bruno retry guidance.",
                 inputSchema: [
                     "type": .string("object"),
                     "properties": .object([:]),
@@ -416,7 +416,7 @@ public final class StdioMCPServer {
                         ]),
                         "payload": .object([
                             "type": .string("object"),
-                            "description": .string("Typed action payload. Must include repo, resource number, grant_ref, auth_lease_ref, and broker-local credential_ref. github.pr.merge also requires cwd so Broker can read git config user.email.")
+                            "description": .string("Typed action payload. Call `list_remote_actions` for required fields, optional fields, evidence fields, and Bruno retry guidance. github.pr.merge requires cwd so Broker can read git config user.email.")
                         ]),
                         "requester": .object([
                             "type": .string("string"),
