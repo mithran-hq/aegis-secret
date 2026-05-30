@@ -412,11 +412,11 @@ public final class StdioMCPServer {
                     "properties": .object([
                         "action_id": .object([
                             "type": .string("string"),
-                            "description": .string("Typed action id, such as github.issue.comment or github.issue.close.")
+                            "description": .string("Typed action id, such as github.issue.create, github.issue.comment, or github.issue.close.")
                         ]),
                         "payload": .object([
                             "type": .string("object"),
-                            "description": .string("Typed action payload. Must include repo, resource number, grant_ref, auth_lease_ref, and broker-local credential_ref. github.pr.merge also requires cwd so Broker can read git config user.email.")
+                            "description": .string("Typed action payload. Use list_remote_actions descriptors for required business fields. Broker derives grant, lease, and credential refs unless a descriptor explicitly requires them.")
                         ]),
                         "requester": .object([
                             "type": .string("string"),

@@ -2200,6 +2200,11 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
     public let authLeaseRef: String
     public let executionMode: String
     public let cleanup: String
+    public let requiredPayloadFields: [String]
+    public let optionalPayloadFields: [String]
+    public let evidenceRequirement: String
+    public let samplePayload: JSONValue
+    public let denialRetryPatch: JSONValue?
 
     public init(
         schemaVersion: String = "aegis.broker.remote_authority_action.v1",
@@ -2213,7 +2218,12 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         approvalRequirement: String = "none",
         authLeaseRef: String = "auth-lease://payload",
         executionMode: String = "broker_api_call",
-        cleanup: String = "drop_credentials_after_call"
+        cleanup: String = "drop_credentials_after_call",
+        requiredPayloadFields: [String] = [],
+        optionalPayloadFields: [String] = [],
+        evidenceRequirement: String = "none",
+        samplePayload: JSONValue = .object([:]),
+        denialRetryPatch: JSONValue? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.actionID = actionID
@@ -2227,6 +2237,11 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         self.authLeaseRef = authLeaseRef
         self.executionMode = executionMode
         self.cleanup = cleanup
+        self.requiredPayloadFields = requiredPayloadFields
+        self.optionalPayloadFields = optionalPayloadFields
+        self.evidenceRequirement = evidenceRequirement
+        self.samplePayload = samplePayload
+        self.denialRetryPatch = denialRetryPatch
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -2242,6 +2257,11 @@ public struct RemoteAuthorityActionDescriptor: Codable, Equatable, Sendable {
         case authLeaseRef = "auth_lease_ref"
         case executionMode = "execution_mode"
         case cleanup
+        case requiredPayloadFields = "required_payload_fields"
+        case optionalPayloadFields = "optional_payload_fields"
+        case evidenceRequirement = "evidence_requirement"
+        case samplePayload = "sample_payload"
+        case denialRetryPatch = "denial_retry_patch"
     }
 }
 
@@ -2261,6 +2281,7 @@ public struct RemoteAuthorityActionCatalog: Sendable {
 
     public static func defaultActions() -> [RemoteAuthorityActionDescriptor] {
         [
+            descriptor("github.issue.create", schema: "schema://aegis-broker/github.issue.create.v1", bruno: "none"),
             descriptor("github.issue.comment", schema: "schema://aegis-broker/github.issue.comment.v1", bruno: "none"),
             descriptor("github.issue.close", schema: "schema://aegis-broker/github.issue.state.v1", bruno: "bruno://github.issue.close.v1"),
             descriptor("github.issue.reopen", schema: "schema://aegis-broker/github.issue.state.v1", bruno: "bruno://github.issue.reopen.v1"),
@@ -2272,12 +2293,73 @@ public struct RemoteAuthorityActionCatalog: Sendable {
 
     private static func descriptor(_ actionID: String, schema: String, bruno: String) -> RemoteAuthorityActionDescriptor {
         let policyHash = "sha256:\(sha256Hex(Data("d79:\(actionID):\(schema):\(bruno)".utf8)))"
+        let contract = actionContract(actionID)
         return RemoteAuthorityActionDescriptor(
             actionID: actionID,
             inputSchemaRef: schema,
             policyHash: policyHash,
-            brunoGateRef: bruno
+            brunoGateRef: bruno,
+            requiredPayloadFields: contract.required,
+            optionalPayloadFields: contract.optional,
+            evidenceRequirement: contract.evidence,
+            samplePayload: contract.sample,
+            denialRetryPatch: contract.retryPatch
         )
+    }
+
+    private static func actionContract(_ actionID: String) -> (required: [String], optional: [String], evidence: String, sample: JSONValue, retryPatch: JSONValue?) {
+        switch actionID {
+        case "github.issue.create":
+            return (
+                ["repo", "title", "body"],
+                ["labels", "project_ref", "requester_ref", "session_ref"],
+                "none",
+                .object([
+                    "repo": .string("OWNER/REPO"),
+                    "title": .string("Issue title"),
+                    "body": .string("Issue body"),
+                ]),
+                .object(["payload": .object(["title": .string("Issue title"), "body": .string("Issue body")])])
+            )
+        case "github.issue.comment":
+            return (
+                ["repo", "issue_number", "body"],
+                ["project_ref", "requester_ref", "session_ref"],
+                "none",
+                .object([
+                    "repo": .string("OWNER/REPO"),
+                    "issue_number": .integer(123),
+                    "body": .string("Comment body"),
+                ]),
+                .object(["payload": .object(["issue_number": .integer(123), "body": .string("Comment body")])])
+            )
+        case "github.pr.merge":
+            return (
+                ["repo", "pr_number", "cwd", "evidence_refs"],
+                ["merge_method", "expected_head_oid", "commit_headline", "commit_body", "project_ref", "requester_ref", "session_ref"],
+                "non_empty_evidence_refs_required",
+                .object([
+                    "repo": .string("OWNER/REPO"),
+                    "pr_number": .integer(123),
+                    "cwd": .string("/workspace/repo"),
+                    "merge_method": .string("squash"),
+                    "evidence_refs": .array([.string("bruno-evidence://review/123")]),
+                ]),
+                .object(["payload": .object(["evidence_refs": .array([.string("bruno-evidence://review/123")])])])
+            )
+        default:
+            return (
+                ["repo"],
+                ["auth_lease_ref", "grant_ref", "credential_ref", "project_ref", "requester_ref", "session_ref"],
+                brunoEvidenceRequirement(actionID),
+                .object(["repo": .string("OWNER/REPO")]),
+                nil
+            )
+        }
+    }
+
+    private static func brunoEvidenceRequirement(_ actionID: String) -> String {
+        actionID == "github.issue.comment" || actionID == "github.pr.comment" ? "none" : "bruno_evidence_refs_optional"
     }
 }
 
@@ -2330,8 +2412,16 @@ public struct SecretStoreRemoteAuthorityLeaseProvider: RemoteAuthorityLeaseProvi
         guard safeAuthorityRef(authLeaseRef, prefixes: ["auth-lease://"]) else {
             throw AegisSecretError.blocked("broker_auth_lease_denied: auth lease ref is unsafe.")
         }
-        guard safeAuthorityRef(grantRef, prefixes: ["auth-grant://", "grant://"]) else {
+        guard safeAuthorityRef(grantRef, prefixes: ["auth-grant://", "grant://", "scm-grant://"]) else {
             throw AegisSecretError.blocked("broker_auth_lease_denied: grant ref is unsafe.")
+        }
+        if credentialRef.hasPrefix("scm-grant://github/") {
+            return try await redeemAegisSourceControlLease(
+                payload: payload,
+                authLeaseRef: authLeaseRef,
+                grantRef: grantRef,
+                credentialRef: credentialRef
+            )
         }
         guard let secretKey = secretReferenceKey(from: credentialRef) else {
             throw AegisSecretError.blocked("broker_auth_lease_denied: credential ref must be broker-local.")
@@ -2350,6 +2440,91 @@ public struct SecretStoreRemoteAuthorityLeaseProvider: RemoteAuthorityLeaseProvi
         }
         guard let token = String(data: tokenData, encoding: .utf8)?.trimmedNonEmpty else {
             throw AegisSecretError.blocked("broker_credential_materialization_failed: credential material was unavailable.")
+        }
+        return RemoteAuthorityLease(authLeaseRef: authLeaseRef, grantRef: grantRef, token: token)
+    }
+
+    private func redeemAegisSourceControlLease(
+        payload: [String: JSONValue],
+        authLeaseRef: String,
+        grantRef: String,
+        credentialRef: String
+    ) async throws -> RemoteAuthorityLease {
+        let repo = try requiredString(payload, "repo")
+        guard safeGitHubRepo(repo) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: repo scope is unsafe.")
+        }
+        let scopeKind = stringValue(payload["scope_kind"]) ?? "repository"
+        guard ["repository", "organization", "installation"].contains(scopeKind) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: scope kind is unsafe.")
+        }
+        let command = ProcessInfo.processInfo.environment["AEGIS_SOURCE_CONTROL_BROKER_COMMAND"]?.trimmedNonEmpty ?? "aegis"
+        guard !command.contains(where: \.isWhitespace) else {
+            throw AegisSecretError.blocked("broker_auth_lease_denied: source-control broker command is unsafe.")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: command)
+        if !command.hasPrefix("/") {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        }
+        process.arguments = command.hasPrefix("/") ? [
+            "lease",
+            "create",
+            "--provider",
+            "github",
+            "--grant-ref",
+            grantRef,
+            "--requested-repo",
+            repo,
+            "--scope-kind",
+            scopeKind,
+            "--credential-ref",
+            credentialRef,
+            "--session-id",
+            "broker-remote-action",
+            "--json",
+        ] : [
+            command,
+            "lease",
+            "create",
+            "--provider",
+            "github",
+            "--grant-ref",
+            grantRef,
+            "--requested-repo",
+            repo,
+            "--scope-kind",
+            scopeKind,
+            "--credential-ref",
+            credentialRef,
+            "--session-id",
+            "broker-remote-action",
+            "--json",
+        ]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: source-control broker was unavailable.")
+        }
+        guard process.terminationStatus == 0 else {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: source-control broker denied the lease.")
+        }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              root["status"] as? String == "ready",
+              root["grant_ref"] as? String == grantRef,
+              root["requested_repo"] as? String == repo,
+              root["scope_kind"] as? String == scopeKind,
+              root["credential_ref"] as? String == credentialRef,
+              root["credential_kind"] as? String == "github_app_installation_token",
+              let token = ((root["git_password"] as? String) ?? (root["access_token"] as? String) ?? (root["credential_material"] as? String))?.trimmedNonEmpty else {
+            throw AegisSecretError.blocked("broker_credential_materialization_failed: source-control broker response was invalid.")
         }
         return RemoteAuthorityLease(authLeaseRef: authLeaseRef, grantRef: grantRef, token: token)
     }
@@ -2459,9 +2634,10 @@ public struct URLSessionGitHubRemoteAuthorityClient: GitHubRemoteAuthorityClient
         guard (200...299).contains(status) else {
             throw AegisSecretError.blocked("broker_remote_action_failed: GitHub returned HTTP \(status).")
         }
+        let resourceRef = resourceRefForGitHubRESTResponse(operation: operation, responseData: data)
         return RemoteAuthorityActionOutput(
             statusCode: status,
-            resourceRef: nil,
+            resourceRef: resourceRef,
             responseSHA256: "sha256:\(sha256Hex(data))"
         )
     }
@@ -2749,7 +2925,11 @@ public struct RemoteAuthorityActionRunner: Sendable {
     public func run(_ request: RemoteAuthorityActionRequest) async throws -> RemoteAuthorityActionInvocationResult {
         let descriptor = try catalog.descriptor(actionID: request.actionID)
         let startedAt = now()
-        let payload = try objectPayload(request.payload)
+        let payload = try normalizeRemoteActionPayload(
+            actionID: request.actionID,
+            payload: try objectPayload(request.payload),
+            descriptor: descriptor
+        )
         let repo = try requiredString(payload, "repo")
         guard safeGitHubRepo(repo) else {
             throw AegisSecretError.blocked("broker_policy_denied: repo scope is unsafe.")
@@ -2757,14 +2937,19 @@ public struct RemoteAuthorityActionRunner: Sendable {
         let authorIdentity = try authorIdentityEvidenceIfNeeded(actionID: request.actionID, repo: repo, payload: payload)
         let resourceScopeRef = try resourceScopeRef(actionID: request.actionID, repo: repo, payload: payload)
         let projectRef = stringValue(payload["project_ref"]) ?? "project://local"
+        let leaseRequest = RemoteAuthorityActionRequest(
+            actionID: request.actionID,
+            payload: .object(payload),
+            requester: request.requester
+        )
 
         let brunoDecisionRef = try await evaluateBrunoIfNeeded(
             descriptor: descriptor,
-            request: request,
+            request: leaseRequest,
             repo: repo,
             resourceScopeRef: resourceScopeRef
         )
-        let lease = try await leaseProvider.lease(for: request, descriptor: descriptor)
+        let lease = try await leaseProvider.lease(for: leaseRequest, descriptor: descriptor)
         let operation = try githubOperation(actionID: request.actionID, repo: repo, payload: payload, authorEmail: authorIdentity?.email)
         let output = try await githubClient.execute(operation: operation, token: lease.token)
         let evidence = RemoteAuthorityActionEvidence(
@@ -2935,6 +3120,52 @@ private func objectPayload(_ value: JSONValue) throws -> [String: JSONValue] {
     return payload
 }
 
+private func normalizeRemoteActionPayload(
+    actionID: String,
+    payload: [String: JSONValue],
+    descriptor: RemoteAuthorityActionDescriptor
+) throws -> [String: JSONValue] {
+    let missing = descriptor.requiredPayloadFields.filter { key in
+        payload[key] == nil || payload[key] == .null
+    }
+    if !missing.isEmpty {
+        throw missingFieldsError(actionID: actionID, missingFields: missing, descriptor: descriptor)
+    }
+    if descriptor.evidenceRequirement == "non_empty_evidence_refs_required" {
+        if arrayValue(payload["evidence_refs"])?.isEmpty != false {
+            throw missingFieldsError(actionID: actionID, missingFields: ["evidence_refs"], descriptor: descriptor)
+        }
+    }
+    let repo = try requiredString(payload, "repo")
+    if let grantRef = stringValue(payload["grant_ref"]),
+       grantRef.hasPrefix("scm-grant://github/"),
+       grantRef != "scm-grant://github/\(repo)" {
+        throw AegisSecretError.blocked("broker_auth_lease_denied: wrong_repo_grant requested_repo=\(repo)")
+    }
+    var normalized = payload
+    let grantRef = stringValue(payload["grant_ref"]) ?? "scm-grant://github/\(repo)"
+    normalized["grant_ref"] = .string(grantRef)
+    normalized["credential_ref"] = .string(stringValue(payload["credential_ref"]) ?? grantRef)
+    normalized["auth_lease_ref"] = .string(stringValue(payload["auth_lease_ref"]) ?? "auth-lease://aegis/github-app/\(repo)")
+    normalized["scope_kind"] = .string(stringValue(payload["scope_kind"]) ?? "repository")
+    return normalized
+}
+
+private func missingFieldsError(
+    actionID: String,
+    missingFields: [String],
+    descriptor: RemoteAuthorityActionDescriptor
+) -> AegisSecretError {
+    let payload = JSONValue.object([
+        "reason": .string("missing_fields"),
+        "action_id": .string(actionID),
+        "missing_fields": .array(missingFields.map { .string($0) }),
+        "retry_payload_patch": descriptor.denialRetryPatch ?? .object([:]),
+    ])
+    let encoded = (try? JSONEncoder().encode(payload)).map { String(decoding: $0, as: UTF8.self) } ?? "{\"reason\":\"missing_fields\"}"
+    return AegisSecretError.blocked("broker_policy_denied: \(encoded)")
+}
+
 private func stringValue(_ value: JSONValue?) -> String? {
     value?.stringValue?.trimmedNonEmpty
 }
@@ -2994,6 +3225,9 @@ private func safeGitHubRepo(_ value: String) -> Bool {
 }
 
 private func resourceScopeRef(actionID: String, repo: String, payload: [String: JSONValue]) throws -> String {
+    if actionID == "github.issue.create" {
+        return "github://\(repo)/issues/new"
+    }
     if actionID.hasPrefix("github.issue.") {
         return "github://\(repo)/issues/\(try requiredInteger(payload, "issue_number"))"
     }
@@ -3010,6 +3244,17 @@ private func githubOperation(
     authorEmail: String? = nil
 ) throws -> GitHubRemoteAuthorityOperation {
     switch actionID {
+    case "github.issue.create":
+        let title = try requiredString(payload, "title")
+        let body = try requiredString(payload, "body")
+        return GitHubRemoteAuthorityOperation(
+            method: "POST",
+            path: "/repos/\(repo)/issues",
+            body: .object([
+                "title": .string(title),
+                "body": .string(body),
+            ])
+        )
     case "github.issue.comment":
         let issue = try requiredInteger(payload, "issue_number")
         let body = try requiredString(payload, "body")
@@ -3077,6 +3322,21 @@ private func githubOperation(
     default:
         throw AegisSecretError.blocked("broker_action_unsupported: typed action `\(actionID)` is not supported.")
     }
+}
+
+private func resourceRefForGitHubRESTResponse(operation: GitHubRemoteAuthorityOperation, responseData: Data) -> String? {
+    guard operation.method == "POST" else {
+        return nil
+    }
+    let parts = operation.path.split(separator: "/").map(String.init)
+    guard parts.count == 4,
+          parts[0] == "repos",
+          parts[3] == "issues",
+          let root = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+          let number = root["number"] as? Int else {
+        return nil
+    }
+    return "github://\(parts[1])/\(parts[2])/issues/\(number)"
 }
 
 private func validateAuthorEmail(_ value: String, repo: String) throws {

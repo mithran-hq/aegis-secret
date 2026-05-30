@@ -935,6 +935,178 @@ final class AegisSecretCoreTests: XCTestCase {
         XCTAssertFalse(encoded.contains("\(secretEnvironmentReferencePrefix)github-app-token"))
     }
 
+    func testRemoteAuthorityGitHubIssueCreateSucceedsWithTypedActionAndEvidence() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { request, descriptor in
+                XCTAssertEqual(request.actionID, "github.issue.create")
+                XCTAssertEqual(descriptor.inputSchemaRef, "schema://aegis-broker/github.issue.create.v1")
+                XCTAssertEqual(descriptor.grantClass, "github_issue_pr_mutation")
+                return RemoteAuthorityLease(
+                    authLeaseRef: "auth-lease://github-app/aegis-secret/issues",
+                    grantRef: "auth-grant://github_issue_pr_mutation/aegis-secret",
+                    token: "secret-token-123"
+                )
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { operation, token in
+                XCTAssertEqual(token, "secret-token-123")
+                XCTAssertEqual(operation.method, "POST")
+                XCTAssertEqual(operation.path, "/repos/mithran-hq/aegis-secret/issues")
+                XCTAssertEqual(operation.body, .object([
+                    "title": .string("Broker smoke"),
+                    "body": .string("Safe to close."),
+                ]))
+                return RemoteAuthorityActionOutput(
+                    statusCode: 201,
+                    resourceRef: "github://mithran-hq/aegis-secret/issues/24",
+                    responseSHA256: "sha256:def456"
+                )
+            },
+            brunoEvaluator: StubBrunoGuardEvaluator { _ in
+                XCTFail("issue creation does not require Bruno")
+                return BrunoGuardDecision(decision: "deny")
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+
+        let result = try await runner.run(RemoteAuthorityActionRequest(
+            actionID: "github.issue.create",
+            payload: remoteIssueCreatePayload(title: "Broker smoke", body: "Safe to close."),
+            requester: "Codex"
+        ))
+
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.evidence.actionID, "github.issue.create")
+        XCTAssertEqual(result.evidence.resourceScopeRef, "github://mithran-hq/aegis-secret/issues/new")
+        let output = try XCTUnwrap(result.evidence.output)
+        XCTAssertEqual(output.statusCode, 201)
+        XCTAssertEqual(output.resourceRef, "github://mithran-hq/aegis-secret/issues/24")
+    }
+
+    func testRemoteAuthorityActionDescriptorsExposeMachineActionableSchemas() throws {
+        let actions = RemoteAuthorityActionCatalog().actions
+        let create = try XCTUnwrap(actions.first { $0.actionID == "github.issue.create" })
+        let comment = try XCTUnwrap(actions.first { $0.actionID == "github.issue.comment" })
+        let merge = try XCTUnwrap(actions.first { $0.actionID == "github.pr.merge" })
+
+        XCTAssertEqual(create.requiredPayloadFields, ["repo", "title", "body"])
+        XCTAssertEqual(comment.requiredPayloadFields, ["repo", "issue_number", "body"])
+        XCTAssertEqual(merge.requiredPayloadFields, ["repo", "pr_number", "cwd", "evidence_refs"])
+        XCTAssertEqual(merge.evidenceRequirement, "non_empty_evidence_refs_required")
+        XCTAssertEqual(merge.inputSchemaRef, "schema://aegis-broker/github.pr.merge.v1")
+        XCTAssertNotNil(merge.denialRetryPatch)
+        XCTAssertEqual(create.samplePayload.objectValue?["repo"], .string("OWNER/REPO"))
+
+        let encoded = String(decoding: try JSONEncoder().encode(actions), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("secret-token"))
+        XCTAssertFalse(encoded.contains("github_pat_"))
+        XCTAssertFalse(encoded.contains("ghp_"))
+        XCTAssertFalse(encoded.contains("/Users/"))
+    }
+
+    func testRemoteAuthorityBusinessPayloadDerivesLeaseRefsForIssueCreate() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { request, _ in
+                let payload = try XCTUnwrap(request.payload.objectValue)
+                XCTAssertEqual(payload["repo"], .string("mithran-hq/aegis-secret"))
+                XCTAssertEqual(payload["auth_lease_ref"], .string("auth-lease://aegis/github-app/mithran-hq/aegis-secret"))
+                XCTAssertEqual(payload["grant_ref"], .string("scm-grant://github/mithran-hq/aegis-secret"))
+                XCTAssertEqual(payload["credential_ref"], .string("scm-grant://github/mithran-hq/aegis-secret"))
+                return RemoteAuthorityLease(
+                    authLeaseRef: "auth-lease://aegis/github-app/mithran-hq/aegis-secret",
+                    grantRef: "scm-grant://github/mithran-hq/aegis-secret",
+                    token: "secret-token-123"
+                )
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { operation, _ in
+                XCTAssertEqual(operation.method, "POST")
+                XCTAssertEqual(operation.path, "/repos/mithran-hq/aegis-secret/issues")
+                return RemoteAuthorityActionOutput(
+                    statusCode: 201,
+                    resourceRef: "github://mithran-hq/aegis-secret/issues/24",
+                    responseSHA256: "sha256:def456"
+                )
+            },
+            brunoEvaluator: nil
+        )
+
+        let result = try await runner.run(RemoteAuthorityActionRequest(
+            actionID: "github.issue.create",
+            payload: .object([
+                "repo": .string("mithran-hq/aegis-secret"),
+                "title": .string("Broker smoke"),
+                "body": .string("Safe to close."),
+            ]),
+            requester: "Claude"
+        ))
+
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.evidence.grantRef, "scm-grant://github/mithran-hq/aegis-secret")
+    }
+
+    func testRemoteAuthorityPRMergeMissingEvidenceRefsReturnsRetryPatch() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                XCTFail("lease should not be requested when evidence refs are missing")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "grant://unexpected", token: "secret")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called when evidence refs are missing")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.pr.merge",
+                payload: .object([
+                    "repo": .string("mithran-hq/aegis-secret"),
+                    "pr_number": .integer(42),
+                    "cwd": .string("/tmp/aegis-secret"),
+                ]),
+                requester: "Claude"
+            ))
+            XCTFail("expected missing evidence refs")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("\"reason\":\"missing_fields\""))
+            XCTAssertTrue(error.description.contains("\"missing_fields\":[\"evidence_refs\"]"))
+            XCTAssertTrue(error.description.contains("\"retry_payload_patch\""))
+            XCTAssertTrue(error.description.contains("bruno-evidence:"))
+            XCTAssertFalse(error.description.contains("secret-token"))
+        }
+    }
+
+    func testRemoteAuthorityWrongRepoGrantDenialIsDistinct() async throws {
+        let runner = RemoteAuthorityActionRunner(
+            leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
+                XCTFail("lease should not be requested for a wrong repo grant")
+                return RemoteAuthorityLease(authLeaseRef: "auth-lease://unexpected", grantRef: "grant://unexpected", token: "secret")
+            },
+            githubClient: StubGitHubRemoteAuthorityClient { _, _ in
+                XCTFail("GitHub should not be called for a wrong repo grant")
+                return RemoteAuthorityActionOutput(statusCode: 200, resourceRef: nil, responseSHA256: "sha256:unused")
+            },
+            brunoEvaluator: nil
+        )
+
+        do {
+            _ = try await runner.run(RemoteAuthorityActionRequest(
+                actionID: "github.issue.create",
+                payload: .object([
+                    "repo": .string("getnexar/corp-load-balancer"),
+                    "title": .string("Broker smoke"),
+                    "body": .string("Safe to close."),
+                    "grant_ref": .string("scm-grant://github/mithran-hq/aegis"),
+                ]),
+                requester: "Claude"
+            ))
+            XCTFail("expected wrong repo grant denial")
+        } catch let error as AegisSecretError {
+            XCTAssertTrue(error.description.contains("broker_auth_lease_denied: wrong_repo_grant"))
+            XCTAssertTrue(error.description.contains("getnexar/corp-load-balancer"))
+        }
+    }
+
     func testRemoteAuthorityGitHubIssueCloseFailsClosedWhenBrunoDenies() async throws {
         let runner = RemoteAuthorityActionRunner(
             leaseProvider: StubRemoteAuthorityLeaseProvider { _, _ in
@@ -2410,6 +2582,25 @@ final class AegisSecretCoreTests: XCTestCase {
             payload["body"] = .string(body)
         }
         return .object(payload)
+    }
+
+    private func remoteIssueCreatePayload(title: String, body: String) -> JSONValue {
+        .object([
+            "repo": .string("mithran-hq/aegis-secret"),
+            "title": .string(title),
+            "body": .string(body),
+            "project_ref": .string("project://d79"),
+            "session_ref": .string("agent-session://local/test"),
+            "auth_lease_ref": .string("auth-lease://github-app/aegis-secret/issues"),
+            "grant_ref": .string("auth-grant://github_issue_pr_mutation/aegis-secret"),
+            "credential_ref": .string("\(secretEnvironmentReferencePrefix)github-app-token"),
+            "evidence_refs": .array([
+                .object([
+                    "ref": .string("evidence://d79/smoke"),
+                    "redaction_state": .string("metadata_only"),
+                ])
+            ]),
+        ])
     }
 
     private func remotePRMergePayload(cwd: String) -> JSONValue {
